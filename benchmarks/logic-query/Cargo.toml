@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pathmap = { workspace=true }
+pathmap = { workspace=true, features=["counters"] }
 mork-frontend = { workspace=true }
 mork-bytestring = { workspace=true }
 libz-sys = "1.1.21"
+fastrace = "*"

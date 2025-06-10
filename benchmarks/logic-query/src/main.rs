@@ -253,12 +253,25 @@ fn transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(stack: &mut Vec<u8>,
     }
     stack.push(last);
 }
-
 fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last: *mut u8, loc: &mut ReadZipperUntracked<()>, references: &mut Vec<(u32, u32)>, f: &mut F) {
+    macro_rules! trace {
+        ($name:ident) => {
+            let concat = concat!("rt/", stringify!($name));
+            let _guard = ::fastrace::prelude::LocalSpan::enter_with_local_parent(concat);
+        };
+        () => {
+            let _guard = ::fastrace::prelude::LocalSpan::enter_with_local_parent("rt");
+        };
+    }
+    trace!();
     unsafe {
     macro_rules! unroll {
-    (ACTION $recursive:expr) => { f(loc); };
+    (ACTION $recursive:expr) => {
+        trace!(ACTION);
+        f(loc);
+    };
     (ITER_AT_DEPTH $recursive:expr) => {
+        trace!(ITER_AT_DEPTH);
         let level = *last; last = last.offset(-1);
 
         let mut i = 0;
@@ -299,6 +312,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = level;
     };
     (ITER_NESTED $recursive:expr) => {
+        trace!(ITER_NESTED);
         let arity = *last; last = last.offset(-1);
         if arity == 0 {
           referential_transition(last, loc, references, f);
@@ -314,6 +328,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = arity;
     };
     (ITER_SYMBOL_SIZE $recursive:expr) => {
+        trace!(ITER_SYMBOL_SIZE);
         let m = loc.child_mask() & SIZES.into();
         let mut it = m.iter();
 
@@ -335,6 +350,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         }
     };
     (ITER_SYMBOLS $recursive:expr) => {
+        trace!(ITER_SYMBOLS);
          last = last.offset(1); *last = ITER_AT_DEPTH;
          // last = last.offset(1); *last = ITER_SYMBOL_SIZE;
          unroll!(ITER_SYMBOL_SIZE $recursive);
@@ -342,6 +358,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
          last = last.offset(-1);
     };
     (ITER_VARIABLES $recursive:expr) => {
+        trace!(ITER_VARIABLES);
         let m = loc.child_mask() & VARS.into();
         let mut it = m.iter();
 
@@ -353,6 +370,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         }
     };
     (ITER_ARITIES $recursive:expr) => {
+        trace!(ITER_ARITIES);
         let m = loc.child_mask() & ARITIES.into();
         let mut it = m.iter();
 
@@ -374,6 +392,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         }
     };
     (ITER_EXPR $recursive:expr) => {
+        trace!(ITER_EXPR);
         unroll!(ITER_VARIABLES $recursive);
 
         unroll!(ITER_SYMBOLS $recursive);
@@ -385,6 +404,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(-1);
     };
     (ITER_SYMBOL $recursive:expr) => {
+        trace!(ITER_SYMBOL);
         let size = *last; last = last.offset(-1);
         let mut v = [0; 64];
         for i in 0..size { *v.get_unchecked_mut(i as usize) = *last; last = last.offset(-1); }
@@ -400,6 +420,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = size;
     };
     (ITER_VAR_SYMBOL $recursive:expr) => {
+        trace!(ITER_VAR_SYMBOL);
         let size = *last; last = last.offset(-1);
         let mut v = [0; 64];
         for i in 0..size { *v.get_unchecked_mut(i as usize) = *last; last = last.offset(-1); }
@@ -417,6 +438,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = size;
     };
     (ITER_ARITY $recursive:expr) => {
+        trace!(ITER_ARITY);
         let arity = *last; last = last.offset(-1);
         if loc.descend_to_byte(item_byte(Tag::Arity(arity))) {
             referential_transition(last, loc, references, f);
@@ -425,6 +447,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = arity;
     };
     (ITER_VAR_ARITY $recursive:expr) => {
+        trace!(ITER_VAR_ARITY);
         let arity = *last; last = last.offset(-1);
 
         unroll!(ITER_VARIABLES $recursive);
@@ -436,16 +459,19 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = arity;
     };
     (BEGIN_RANGE $recursive:expr) => {
+        trace!(BEGIN_RANGE);
         references.push((loc.path().len() as u32, 0));
         $recursive;
         references.pop();
     };
     (FINALIZE_RANGE $recursive:expr) => {
+        trace!(FINALIZE_RANGE);
         references.last_mut().unwrap().1 = loc.path().len() as u32;
         $recursive;
         references.last_mut().unwrap().1 = 0;
     };
     (REFER_RANGE $recursive:expr) => {
+        trace!(REFER_RANGE);
         let index = *last; last = last.offset(-1);
         let (begin, end) = references[index as usize];
         let subexpr = Expr { ptr: loc.path()[begin as usize..end as usize].as_ptr().cast_mut() };
@@ -483,6 +509,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         last = last.offset(1); *last = index;
     };
     (DISPATCH $s:ident $recursive:expr) => {
+        trace!(DISPATCH);
         match $s {
             ITER_AT_DEPTH => { unroll!(ITER_AT_DEPTH $recursive); }
             ITER_SYMBOL_SIZE => { unroll!(ITER_SYMBOL_SIZE $recursive); }
@@ -503,6 +530,7 @@ fn referential_transition<F: FnMut(&mut ReadZipperUntracked<()>) -> ()>(mut last
         }
     };
     (CALL $recursive:expr) => {
+        trace!(CALL);
         {
             let lastv = *last;
             last = last.offset(-1);
@@ -646,6 +674,17 @@ impl Parser for DataParser {
 
 
 fn main() {
+    use ::fastrace::{
+        collector::{Config, SpanContext},
+        prelude::LocalSpan,
+        Span,
+    };
+    ::fastrace::set_reporter(pathmap::timed_span::MyReporter, Config::default());
+    let func = ::fastrace::func_path!();
+    let root = Span::root(func, SpanContext::random());
+    let guard1 = root.set_local_parent();
+    let guard2 = LocalSpan::enter_with_local_parent("main");
+
     // SETUP PROCEDURE?
     for size in 1..64 {
         let k = item_byte(Tag::SymbolSize(size));
@@ -663,9 +702,13 @@ fn main() {
     }
 
 
-    // let mut file = std::fs::File::open("/home/adam/Projects/metta-examples/aunt-kg/royal92.metta")
-    let mut file = std::fs::File::open("/home/adam/Projects/MORK/benchmarks/logic-query/resources/big.metta")
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let file_name = "big.metta";
+    // let file_name = "royal92.metta";
+    let file_path = format!("{manifest_dir}/../../../data/{file_name}");
+    let mut file = std::fs::File::open(file_path)
         .expect("Should have been able to read the file");
+
     let mut buf = vec![];
     file.read_to_end(&mut buf).unwrap();
     let mut it = Context::new(&buf[..]);
@@ -705,11 +748,14 @@ fn main() {
     buffer[1] = ITER_EXPR;
     let mut references: Vec<(u32, u32)> = vec![];
     referential_transition(&mut buffer[1], &mut z, &mut references, &mut |loc| {
+        let _guard = LocalSpan::enter_with_local_parent("referential_transition_callback");
+
     // // transition(&mut buffer, &mut z, &mut |loc| {
         black_box(loc.origin_path());
         visited += 1;
     });
     println!("iterating all ({}) took {} microseconds", visited, t0.elapsed().as_micros());
+    pathmap::timed_span::print_counters();
 
     // let mut keeping = BytesTrieMap::from_iter(space.iter());
 
@@ -743,6 +789,8 @@ fn main() {
     // while let Some(_) = rrz.to_next_val() {
     //     assert!(recover.contains(rrz.path()));
     // }
+    drop(guard2); drop(guard1);
+    ::fastrace::flush();
 
     return;
     // let mut keeping_wz = keeping.write_zipper();
@@ -811,6 +859,8 @@ fn main() {
 
     println!("searching all in all (queries {} average res {}, max res {}) took {} microseconds", k, total_res/k, max_res, t0.elapsed().as_micros());
     println!("total unified {} (max unified {})", total_unified, max_unified);
+    pathmap::timed_span::print_counters();
+
     // println!("kept {}", keeping.val_count());
     // with unification, with all_dense_nodes
     // transition
