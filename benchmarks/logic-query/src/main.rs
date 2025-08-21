@@ -664,7 +664,9 @@ fn main() {
 
 
     // let mut file = std::fs::File::open("/home/adam/Projects/metta-examples/aunt-kg/royal92.metta")
-    let mut file = std::fs::File::open("/home/adam/Projects/MORK/benchmarks/logic-query/resources/big.metta")
+    let file_path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("resources/big.metta");
+    let mut file = std::fs::File::open(file_path)
+    // let mut file = std::fs::File::open("/home/adam/Projects/MORK/benchmarks/logic-query/resources/big.metta")
         .expect("Should have been able to read the file");
     let mut buf = vec![];
     file.read_to_end(&mut buf).unwrap();

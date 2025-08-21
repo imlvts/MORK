@@ -347,7 +347,7 @@ pub trait Space: Sized {
 
         let mut template_wzs: Vec<_> = writers.iter_mut().map(|writer| self.write_zipper(writer)).collect();
 
-        let result = transform_multi_multi_impl(patterns, &pattern_rzs, templates, template_prefixes, &mut template_wzs);
+        let result = transform_multi_multi_impl(patterns, pattern_rzs, templates, template_prefixes, &mut template_wzs);
 
         for wz in template_wzs {
             self.cleanup_write_zipper(wz);

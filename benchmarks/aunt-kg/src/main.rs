@@ -67,7 +67,10 @@ fn main() -> Result<(),&'static str> {
 
     // let mut file = std::fs::File::open("/home/adam/Projects/metta-examples/aunt-kg/toy.metta")
     // let mut file = std::fs::File::open("/home/adam/Projects/metta-examples/aunt-kg/royal92_simple.metta")
-    let mut file = std::fs::File::open("/Users/admin/Desktop/royal92_simple.metta")
+    let file_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../data/royal92_simple.metta");
+    let mut file = std::fs::File::open(file_path)
+    // let mut file = std::fs::File::open("/Users/admin/Desktop/royal92_simple.metta")
     // let mut file = std::fs::File::open("/Users/admin/Desktop/royal92_chopped.metta")
         .expect("Should have been able to read the file");
     let mut buf = vec![];

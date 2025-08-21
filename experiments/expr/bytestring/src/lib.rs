@@ -1,4 +1,5 @@
-
+// I just want to be able to read warnings, there's too much here
+#![allow(unused_unsafe, unused_mut, unused_imports, unused_variables, dead_code, non_upper_case_globals)]
 #[allow(unused_imports)]
 use std::{
     fmt::{format, Debug, Formatter, Write}, 
