@@ -1709,7 +1709,6 @@ where
     RZ: ZipperMoving + ZipperReadOnlySubtries<'s, ()> + ZipperAbsolutePath,
     F: FnMut(Result<&[ExprEnv], (BTreeMap<(u8, u8), ExprEnv>, u8, u8, &[(u8, u8)])>, Expr) -> bool,
 {
-    panic!("huh");
         let make_prefix = |e:&Expr|  unsafe { e.prefix().unwrap_or_else(|_| e.span()).as_ref().unwrap() };
 
         //Sanity check.  Confirm the pattern read zippers match the expression paths
@@ -1742,32 +1741,21 @@ where
         }
         virtual_path.extend_from_slice(first_pattern_prefix);
 
-        //Make a temp map for the first pattern
-        let mut first_temp_map = PathMap::new();
-        first_temp_map.write_zipper_at_path(&virtual_path[..]).graft(&rz0);
-        let first_rz = first_temp_map.read_zipper_at_path(&virtual_path[..1]);
-        // let mut first_rz = PrefixZipper::new(&virtual_path[..], rz0);
-        // first_rz.set_origin(&virtual_path[..1]).unwrap();
+        let mut first_rz = PrefixZipper::new(&virtual_path[..], rz0);
+        first_rz.set_origin(&virtual_path[..1]).unwrap();
 
         //Make temp maps for the rest of the patterns
         let mut tmp_maps = vec![];
         // XXX
         for (rz, pat) in pattern_rzs.into_iter().zip(pat_rest) {
             let prefix = make_prefix(&pat.borrow());
-            let mut temp_map = PathMap::new();
-            if !rz.path_exists() {
-                trace!("for p={:?} prefix {} not in map", pat.borrow(), serialize(prefix));
-                return 0
-            }
-            temp_map.write_zipper_at_path(prefix).graft(&rz);
-            tmp_maps.push(temp_map);
-            // tmp_maps.push(PrefixZipper::new(prefix, rz));
+            tmp_maps.push(PrefixZipper::new(prefix, rz));
         }
-        let mut prz = ProductZipperG::new(first_rz, patterns[1..].iter().zip(tmp_maps.iter()).map(|(_p, rz)| {
+        let mut prz = ProductZipperG::new(first_rz, patterns[1..].iter().zip(tmp_maps.into_iter()).map(|(_p, rz)| {
             // let prefix = unsafe { p.prefix().unwrap_or_else(|x| p.span()).as_ref().unwrap() };
             // tmp_maps[i].read_zipper_at_path(prefix)
-            rz.read_zipper()
-            // rz
+            // rz.read_zipper()
+            rz
         }));
         prz.reserve_buffers(4096, 512);
 
