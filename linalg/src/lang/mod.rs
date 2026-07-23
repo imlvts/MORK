@@ -96,6 +96,46 @@ impl<T> Elem for T where
 // Registry: scalar functions and reduction operators
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Which built-in scalar function a registry entry *is*.
+///
+/// Recorded out-of-band in [`Registry::fn_kind`] rather than on
+/// [`FnDef`], for the same reason [`Registry::reduce_kind`] is: `FnDef`'s
+/// fields are public and callers build it with a struct literal, so an
+/// extra field would be a breaking change — and a *user*-registered
+/// function must never be mistaken for a built-in just because it shares
+/// a name or an implementation.
+///
+/// Backends use it to replace an indirect `fn(&[T]) -> T` call per
+/// element with inline, monomorphic, autovectorizable code. Every kind's
+/// inline form is required to be bit-identical to the [`FnDef::eval`] it
+/// stands for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FnKind {
+    /// `-x` (registered for every element type).
+    Neg,
+    /// `max(a, b)` — the comparison form `if b > a { b } else { a }`.
+    Max2,
+    /// `min(a, b)` — `if b < a { b } else { a }`.
+    Min2,
+    Exp,
+    Ln,
+    Sqrt,
+    Abs,
+    /// `if x > 0 { x } else { 0 }` — note `relu(-0.0) == +0.0`.
+    Relu,
+    Tanh,
+}
+
+impl FnKind {
+    /// Arity of the function this kind stands for.
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            FnKind::Max2 | FnKind::Min2 => 2,
+            _ => 1,
+        }
+    }
+}
+
 /// A scalar function usable in call position: `exp(x)`, `max(a, b)`, …
 ///
 /// Registered statically in code via [`Registry::register_fn`]. A
@@ -136,6 +176,12 @@ pub struct ReduceDef<T> {
 pub struct Registry<T> {
     pub(crate) lit: fn(f64) -> T,
     pub(crate) fns: Vec<FnDef<T>>,
+    /// Parallel to `fns`: which built-in scalar function an entry *is*, so
+    /// a backend can inline it instead of calling through
+    /// [`FnDef::eval`]. Only the constructors below ever set a `Some`, so
+    /// a user-registered function stays `None` and keeps the portable
+    /// indirect-call path. See [`FnKind`].
+    pub(crate) fn_kind: Vec<Option<FnKind>>,
     pub(crate) reduces: Vec<ReduceDef<T>>,
     /// Parallel to `reduces`: which built-in semiring operator an entry
     /// *is*, for backends that speak [`crate::einsum::Reduce`] rather than
@@ -175,6 +221,7 @@ impl<T: Elem> Registry<T> {
         let mut r = Registry {
             lit,
             fns: Vec::new(),
+            fn_kind: Vec::new(),
             reduces: Vec::new(),
             reduce_kind: Vec::new(),
         };
@@ -186,10 +233,28 @@ impl<T: Elem> Registry<T> {
         // with exactly `Reduce::identity`'s identities.
         r.reduce_kind =
             vec![Some(Reduce::Sum), Some(Reduce::Prod), Some(Reduce::Max), Some(Reduce::Min)];
-        r.register_fn(FnDef { name: "neg", arity: 1, eval: fn_neg::<T>, zero_preserving: true });
-        r.register_fn(FnDef { name: "max", arity: 2, eval: fn_max2::<T>, zero_preserving: true });
-        r.register_fn(FnDef { name: "min", arity: 2, eval: fn_min2::<T>, zero_preserving: true });
+        r.register_builtin_fn(
+            FnDef { name: "neg", arity: 1, eval: fn_neg::<T>, zero_preserving: true },
+            FnKind::Neg,
+        );
+        r.register_builtin_fn(
+            FnDef { name: "max", arity: 2, eval: fn_max2::<T>, zero_preserving: true },
+            FnKind::Max2,
+        );
+        r.register_builtin_fn(
+            FnDef { name: "min", arity: 2, eval: fn_min2::<T>, zero_preserving: true },
+            FnKind::Min2,
+        );
         r
+    }
+
+    /// [`register_fn`](Self::register_fn) for a function whose semantics
+    /// this crate itself defines, tagging it so backends may inline it.
+    /// Private on purpose: a caller-supplied function is never a built-in.
+    fn register_builtin_fn(&mut self, def: FnDef<T>, kind: FnKind) {
+        assert_eq!(def.arity, kind.arity(), "built-in {:?} arity disagrees with its kind", def.name);
+        self.register_fn(def);
+        *self.fn_kind.last_mut().expect("just registered") = Some(kind);
     }
 
     /// Register a scalar function. Panics on a duplicate name — the
@@ -202,6 +267,7 @@ impl<T: Elem> Registry<T> {
             def.name
         );
         self.fns.push(def);
+        self.fn_kind.push(None);
     }
 
     /// Register a reduction operator. Panics on a duplicate name.
@@ -230,6 +296,11 @@ impl<T> Registry<T> {
     pub(crate) fn builtin_reduce(&self, id: usize) -> Option<crate::einsum::Reduce> {
         self.reduce_kind[id]
     }
+
+    /// Which built-in scalar function `id` is, if any. See [`FnKind`].
+    pub(crate) fn builtin_fn(&self, id: usize) -> Option<FnKind> {
+        self.fn_kind[id]
+    }
 }
 
 macro_rules! float_builtins {
@@ -239,42 +310,35 @@ macro_rules! float_builtins {
             /// `exp`, `ln`, `sqrt`, `abs`, `relu`, `tanh`.
             pub fn builtins() -> Self {
                 let mut r = Self::new(|x| x as $t);
-                r.register_fn(FnDef {
-                    name: "exp",
-                    arity: 1,
-                    eval: |a| a[0].exp(),
-                    zero_preserving: false,
-                });
-                r.register_fn(FnDef {
-                    name: "ln",
-                    arity: 1,
-                    eval: |a| a[0].ln(),
-                    zero_preserving: false,
-                });
-                r.register_fn(FnDef {
-                    name: "sqrt",
-                    arity: 1,
-                    eval: |a| a[0].sqrt(),
-                    zero_preserving: true,
-                });
-                r.register_fn(FnDef {
-                    name: "abs",
-                    arity: 1,
-                    eval: |a| a[0].abs(),
-                    zero_preserving: true,
-                });
-                r.register_fn(FnDef {
-                    name: "relu",
-                    arity: 1,
-                    eval: |a| if a[0] > 0.0 { a[0] } else { 0.0 },
-                    zero_preserving: true,
-                });
-                r.register_fn(FnDef {
-                    name: "tanh",
-                    arity: 1,
-                    eval: |a| a[0].tanh(),
-                    zero_preserving: true,
-                });
+                r.register_builtin_fn(
+                    FnDef { name: "exp", arity: 1, eval: |a| a[0].exp(), zero_preserving: false },
+                    FnKind::Exp,
+                );
+                r.register_builtin_fn(
+                    FnDef { name: "ln", arity: 1, eval: |a| a[0].ln(), zero_preserving: false },
+                    FnKind::Ln,
+                );
+                r.register_builtin_fn(
+                    FnDef { name: "sqrt", arity: 1, eval: |a| a[0].sqrt(), zero_preserving: true },
+                    FnKind::Sqrt,
+                );
+                r.register_builtin_fn(
+                    FnDef { name: "abs", arity: 1, eval: |a| a[0].abs(), zero_preserving: true },
+                    FnKind::Abs,
+                );
+                r.register_builtin_fn(
+                    FnDef {
+                        name: "relu",
+                        arity: 1,
+                        eval: |a| if a[0] > 0.0 { a[0] } else { 0.0 },
+                        zero_preserving: true,
+                    },
+                    FnKind::Relu,
+                );
+                r.register_builtin_fn(
+                    FnDef { name: "tanh", arity: 1, eval: |a| a[0].tanh(), zero_preserving: true },
+                    FnKind::Tanh,
+                );
                 r
             }
         }

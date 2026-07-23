@@ -176,6 +176,27 @@ impl Gen {
         self.tensor(ix)
     }
 
+    /// Wrap `e` in a unary call with probability `num/den`.
+    ///
+    /// Biased towards the four unaries the JIT can emit natively
+    /// (`sqrt`/`abs`/`relu`/`neg`), because those are the ones that decide
+    /// whether a load/store map fuses into a compiled contraction or falls
+    /// back to the tape; the transcendentals exercise the tape-only side
+    /// of the same fusion.
+    fn maybe_map(&mut self, e: Expr, num: u64, den: u64) -> Expr {
+        if !self.rng.chance(num, den) {
+            return e;
+        }
+        const NATIVE: [&str; 4] = ["sqrt", "abs", "relu", "neg"];
+        const OTHER: [&str; 3] = ["exp", "ln", "tanh"];
+        let f = if self.rng.chance(3, 4) {
+            NATIVE[self.rng.below(NATIVE.len())]
+        } else {
+            OTHER[self.rng.below(OTHER.len())]
+        };
+        Expr::Call { func: f.to_string(), args: vec![e] }
+    }
+
     fn expr(&mut self, scope: &[String], depth: usize) -> Expr {
         if depth == 0 || self.rng.chance(1, 3) {
             return if self.rng.chance(1, 6) {
@@ -203,7 +224,13 @@ impl Gen {
                 let b = self.expr(scope, depth - 1);
                 Expr::Call { func: f.to_string(), args: vec![a, b] }
             }
-            _ => self.reduction(scope, depth),
+            _ => {
+                // A unary chain around a reduction is the **store map**
+                // shape: `sqrt(sum(l: …))`, sometimes two deep.
+                let r = self.reduction(scope, depth);
+                let r = self.maybe_map(r, 1, 2);
+                self.maybe_map(r, 1, 5)
+            }
         }
     }
 
@@ -216,11 +243,17 @@ impl Gen {
         // The core leaf carries every bound index, so extents resolve; the
         // optional partner is what turns `sum(k: a[i,k])` into the classic
         // contraction `sum(k: a[i,k] * b[k,j])`.
+        //
+        // Each leaf is wrapped in a unary about half the time: that is the
+        // **load map** shape — `sum(k: relu(a[i,k]) * b[k,j])` is still one
+        // contraction, with the map fused into the load.
         let core = self.leaf(&inner, &bound);
+        let core = self.maybe_map(core, 1, 2);
         let body = if depth > 1 && self.rng.chance(2, 3) {
             let op = [BinOp::Mul, BinOp::Add, BinOp::Sub][self.rng.below(3)];
             let partner = if self.rng.chance(1, 2) {
-                self.leaf(&inner, &[])
+                let l = self.leaf(&inner, &[]);
+                self.maybe_map(l, 1, 2)
             } else {
                 self.expr(&inner, depth - 1)
             };
@@ -342,6 +375,15 @@ struct Stats {
     skipped: usize,
     jit_reductions: usize,
     tape_reductions: usize,
+    /// Step-4 fusions: unary chains folded into a reduction's output, and
+    /// the subset of those (plus per-input load maps) that the JIT emitted
+    /// itself rather than leaving to the tape.
+    store_maps: usize,
+    jit_store_maps: usize,
+    jit_load_maps: usize,
+    /// Built-in calls compiled to inline block code vs left indirect.
+    inline_fn_ops: usize,
+    indirect_fn_ops: usize,
     /// Output elements compared, and how many of those were NaN (whose
     /// payload `bits_eq` deliberately ignores) — a sweep whose outputs
     /// were all NaN would prove nothing.
@@ -401,6 +443,11 @@ fn differential(g: &mut Gen, stats: &mut Stats) {
             stats.checked += 1;
             stats.jit_reductions += report.jit_reductions;
             stats.tape_reductions += report.tape_reductions;
+            stats.store_maps += report.store_maps;
+            stats.jit_store_maps += report.jit_store_maps;
+            stats.jit_load_maps += report.jit_load_maps;
+            stats.inline_fn_ops += report.inline_fn_ops;
+            stats.indirect_fn_ops += report.indirect_fn_ops;
             stats.elems += ref_out.data.len();
             stats.nan_elems += ref_out.data.iter().filter(|v| v.is_nan()).count();
             stats.nan_payload_diffs += fast_out
@@ -467,12 +514,20 @@ fn report(tag: &str, s: &Stats) {
     println!(
         "[{tag}] {} programs bit-identical, {} skipped (bind errors); \
          reductions: {} on the JIT, {} on the tape; \
+         maps: {} store maps fused into the reduction ({} of them emitted by the JIT), \
+         {} load maps fused into a JIT'd contraction; \
+         block ops: {} inline built-ins, {} indirect calls; \
          {} output elements compared ({} NaN, of which {} differed only in \
          NaN payload)",
         s.checked,
         s.skipped,
         s.jit_reductions,
         s.tape_reductions,
+        s.store_maps,
+        s.jit_store_maps,
+        s.jit_load_maps,
+        s.inline_fn_ops,
+        s.indirect_fn_ops,
         s.elems,
         s.nan_elems,
         s.nan_payload_diffs
@@ -489,8 +544,14 @@ fn sweep_random_programs() {
     report("lang_sweep", &s);
     assert!(s.checked > 250, "generator produced too few runnable programs: {}", s.checked);
     assert!(s.tape_reductions > 0, "no reduction exercised the tape kernel");
+    assert!(s.store_maps > 0, "no store map was fused into a reduction");
+    assert!(s.inline_fn_ops > 0, "no built-in was compiled to an inline block op");
     #[cfg(feature = "jit")]
-    assert!(s.jit_reductions > 0, "no reduction reached the JIT");
+    {
+        assert!(s.jit_reductions > 0, "no reduction reached the JIT");
+        assert!(s.jit_load_maps > 0, "no load map was fused into a JIT'd contraction");
+        assert!(s.jit_store_maps > 0, "no store map was emitted by the JIT");
+    }
 }
 
 #[test]
@@ -633,6 +694,137 @@ fn language_examples_are_bit_identical() {
     let mut vv = Dense::<f32>::zeros(vec![3]);
     fill(&mut vv, 13);
     both_paths_agree("y[i,j] = v[i]", &[("v", &vv)], "y", vec![3, 4]);
+}
+
+/// Step 4: per-input unary chains applied at load and an output unary
+/// chain applied to the reduction's result, on the named shapes — with the counters
+/// pinning *where* each one fused, so a silent regression to the old
+/// temp-per-map lowering fails the test rather than just getting slower.
+#[test]
+fn load_and_store_maps_fuse() {
+    let mut a = Dense::<f32>::zeros(vec![5, 6]);
+    let mut b = Dense::<f32>::zeros(vec![6, 4]);
+    let mut v = Dense::<f32>::zeros(vec![6]);
+    fill(&mut a, 51);
+    fill(&mut b, 52);
+    fill(&mut v, 53);
+
+    // Store map on a contraction: `sqrt` folds into the flush, so the
+    // reduction's temporary is the final answer.
+    let r = both_paths_agree(
+        "y[i] = sqrt(sum(j: a[i,j] * v[j]))",
+        &[("a", &a), ("v", &v)],
+        "y",
+        vec![5],
+    );
+    assert_eq!(r.store_maps, 1, "sqrt(sum(..)) must fuse into the reduction");
+    #[cfg(feature = "jit")]
+    {
+        assert_eq!(r.jit_reductions, 1);
+        assert_eq!(r.jit_store_maps, 1, "sqrt is a native JIT store map");
+    }
+
+    // Load map on one operand of a matmul: still one contraction.
+    let r = both_paths_agree(
+        "c[i,k] = sum(j: relu(a[i,j]) * b[j,k])",
+        &[("a", &a), ("b", &b)],
+        "c",
+        vec![5, 4],
+    );
+    #[cfg(feature = "jit")]
+    {
+        assert_eq!(r.jit_reductions, 1, "a mapped operand is still a contraction");
+        assert_eq!(r.jit_load_maps, 1);
+    }
+    #[cfg(not(feature = "jit"))]
+    assert_eq!(r.tape_reductions, 1);
+
+    // Both ends at once, two links deep on the load side.
+    let r = both_paths_agree(
+        "y[i] = abs(neg(sum(j: sqrt(abs(a[i,j])) * neg(v[j]))))",
+        &[("a", &a), ("v", &v)],
+        "y",
+        vec![5],
+    );
+    assert_eq!(r.store_maps, 1);
+    #[cfg(feature = "jit")]
+    {
+        assert_eq!(r.jit_reductions, 1);
+        assert_eq!(r.jit_load_maps, 2, "both operands carry a map");
+        assert_eq!(r.jit_store_maps, 1);
+    }
+
+    // `exp` is not a map this backend emits (it would need a libcall whose
+    // rounding we cannot pin), so the whole reduction stays on the tape —
+    // but the chain still fuses at the flush there.
+    let r = both_paths_agree("s = exp(sum(j: v[j]))", &[("v", &v)], "s", vec![]);
+    assert_eq!(r.store_maps, 1);
+    assert_eq!(r.jit_reductions, 0, "exp store map keeps the reduction on the tape");
+    assert_eq!(r.tape_reductions, 1);
+
+    // Likewise a mapped operand the JIT cannot emit.
+    let r = both_paths_agree(
+        "c[i,k] = sum(j: exp(a[i,j]) * b[j,k])",
+        &[("a", &a), ("b", &b)],
+        "c",
+        vec![5, 4],
+    );
+    assert_eq!(r.jit_reductions, 0);
+    assert_eq!(r.tape_reductions, 1);
+    assert!(r.inline_fn_ops > 0, "exp must still be an inline block op");
+    assert_eq!(r.indirect_fn_ops, 0);
+
+    // A `max`/`min` fold is excluded from the JIT for ±0/NaN reasons, and
+    // that exclusion must survive a store map being present.
+    let r = both_paths_agree("s = sqrt(max(j: v[j]))", &[("v", &v)], "s", vec![]);
+    assert_eq!(r.store_maps, 1);
+    assert_eq!(r.jit_reductions, 0);
+}
+
+/// Only *built-in* functions become inline block code; a caller-registered
+/// one keeps the portable indirect-call path, because nothing else can
+/// know its bits.
+#[test]
+fn registered_functions_stay_indirect() {
+    let mut v = Dense::<f32>::zeros(vec![32]);
+    fill(&mut v, 61);
+
+    let reg_builtin = Registry::<f32>::builtins();
+    let checked =
+        check(&parse("soft[i] = exp(v[i]) / sum(j: exp(v[j]))").unwrap(), &reg_builtin).unwrap();
+    let mut out = Dense::<f32>::zeros(vec![32]);
+    let r = run_reported(
+        &checked,
+        &reg_builtin,
+        &[("v", &v as &dyn NDIndex<f32>)],
+        &mut [("soft", &mut out as &mut dyn NDIndex<f32>)],
+    )
+    .unwrap();
+    assert_eq!(r.indirect_fn_ops, 0, "both `exp`s are built-in");
+    assert_eq!(r.inline_fn_ops, 2);
+
+    let mut reg = Registry::<f32>::builtins();
+    reg.register_fn(linalg::lang::FnDef {
+        name: "myexp",
+        arity: 1,
+        eval: |a| a[0].exp(),
+        zero_preserving: false,
+    });
+    let checked =
+        check(&parse("soft[i] = myexp(v[i]) / sum(j: myexp(v[j]))").unwrap(), &reg).unwrap();
+    let mut mine = Dense::<f32>::zeros(vec![32]);
+    let r = run_reported(
+        &checked,
+        &reg,
+        &[("v", &v as &dyn NDIndex<f32>)],
+        &mut [("soft", &mut mine as &mut dyn NDIndex<f32>)],
+    )
+    .unwrap();
+    assert_eq!(r.inline_fn_ops, 0, "a registered function is never a built-in");
+    assert_eq!(r.indirect_fn_ops, 2);
+
+    // …and the two agree bit for bit, which is the point of the tag.
+    assert!(bits_eq(&out.data, &mine.data).is_none());
 }
 
 /// Storage without a contiguous row-major image keeps the whole run on

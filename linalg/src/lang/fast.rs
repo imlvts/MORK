@@ -28,8 +28,8 @@
 //! surrounding loop was compiled. Whether a result *is* NaN is
 //! deterministic; its sign and payload are not. Every other value —
 //! `±0.0` and `±∞` included — is exact. (`tests/lang_sweep.rs` measures
-//! the size of this hole: 1 element in 72 284 across 20 000 random
-//! programs.)
+//! the size of this hole: it reports how many output elements differed in
+//! NaN payload alone — 0 of 72 242 on the current generator.)
 //!
 //! # What it buys
 //!
@@ -55,13 +55,26 @@
 //!    order. `max`/`min` reductions and `max`/`min` combines are *not*
 //!    routed: Cranelift's `fmax`/`fmin` disagree with the language's
 //!    comparison fold on `±0.0` and NaN.
+//! 4. **Load and store maps** (RESUME.md step 4). Built-in scalar
+//!    functions are recognised by a [`FnKind`] tag the [`Registry`]
+//!    records — never by name and never by function pointer — and become
+//!    inline block code instead of an indirect `fn(&[T]) -> T` call per
+//!    element; that call was most of naive softmax's cost, and it also
+//!    kept the surrounding loop from vectorizing. A unary chain *wrapping*
+//!    a reduction is applied at the flush (`sqrt(sum(l: M[l,j]))` writes
+//!    the finished value straight out, with no second pass), and both ends
+//!    reach the JIT — per-input maps at load, the chain at store — for the
+//!    four unaries Cranelift emits exactly ([`crate::jit::UnaryMap`]).
+//!    Every inline form is required to be bit-identical to the
+//!    [`super::FnDef::eval`] it replaces; a caller-registered function is
+//!    never inlined, because nothing here can know its bits.
 
 use std::collections::HashMap;
 
 use super::ast::BinOp;
 use super::check::{CExpr, Checked, IndexId};
 use super::eval::for_each_index;
-use super::{Elem, Registry};
+use super::{Elem, FnKind, Registry};
 use crate::tensor::NDIndex;
 
 /// Elements processed per inner-tape step. Big enough to amortise the
@@ -159,6 +172,13 @@ enum InOp {
     Splat { outer: usize },
     Gather { load: usize },
     Bin { op: BinOp, a: usize, b: usize },
+    /// A built-in unary applied over the whole block by inline code —
+    /// see [`unary_block`]. `func` is kept only as the fallback for an
+    /// element type the inline form does not cover.
+    Un { kind: FnKind, func: usize, a: usize },
+    /// Built-in elementwise `max`/`min` over two blocks.
+    MaxMin { is_max: bool, a: usize, b: usize },
+    /// Anything else: an indirect `fn(&[T]) -> T` call per element.
     Call { func: usize, args: Vec<usize> },
 }
 
@@ -172,6 +192,10 @@ struct Kernel<T> {
     /// Register holding the region's value: an `inner` register when the
     /// nest is non-empty, an `outer` register otherwise.
     root: usize,
+    /// Block-tape calls compiled to inline code vs left indirect —
+    /// diagnostics only, surfaced through [`RunReport`].
+    n_inline: usize,
+    n_indirect: usize,
 }
 
 /// Where a subexpression's value lives while the tape is being built.
@@ -181,19 +205,23 @@ enum Src {
     Inner(usize),
 }
 
-struct Builder<T> {
+struct Builder<'r, T> {
     /// Loop level of each index id, or `usize::MAX` if not a level here.
     level_of: Vec<usize>,
     n_levels: usize,
     /// Index id of the innermost (blocked) level, if the nest has one.
     inner_id: Option<IndexId>,
+    /// The registry's built-in tags, parallel to its function table.
+    kinds: &'r [Option<FnKind>],
     loads: Vec<LoadDesc>,
     outer: Vec<OutOp<T>>,
     inner: Vec<InOp>,
+    n_inline: usize,
+    n_indirect: usize,
 }
 
-impl<T: Elem> Builder<T> {
-    fn new(levels: &[IndexId], n_ids: usize) -> Self {
+impl<'r, T: Elem> Builder<'r, T> {
+    fn new(levels: &[IndexId], n_ids: usize, kinds: &'r [Option<FnKind>]) -> Self {
         let mut level_of = vec![usize::MAX; n_ids];
         for (k, &id) in levels.iter().enumerate() {
             level_of[id as usize] = k;
@@ -202,9 +230,12 @@ impl<T: Elem> Builder<T> {
             level_of,
             n_levels: levels.len(),
             inner_id: levels.last().copied(),
+            kinds,
             loads: Vec::new(),
             outer: Vec::new(),
             inner: Vec::new(),
+            n_inline: 0,
+            n_indirect: 0,
         }
     }
 
@@ -257,7 +288,23 @@ impl<T: Elem> Builder<T> {
             FExpr::Call { func, args } => {
                 let srcs: Vec<Src> = args.iter().map(|a| self.build(a)).collect();
                 let args: Vec<usize> = srcs.into_iter().map(|s| self.to_inner(s)).collect();
-                self.inner.push(InOp::Call { func: *func, args });
+                // A *built-in* becomes inline block code — one indirect
+                // `fn(&[T]) -> T` call per element is what softmax's `exp`
+                // was spending most of its time on, and it also blocks
+                // autovectorization of everything around it. Anything the
+                // caller registered stays on the portable call path.
+                let op = match self.kinds[*func] {
+                    Some(FnKind::Max2) => InOp::MaxMin { is_max: true, a: args[0], b: args[1] },
+                    Some(FnKind::Min2) => InOp::MaxMin { is_max: false, a: args[0], b: args[1] },
+                    Some(kind) => InOp::Un { kind, func: *func, a: args[0] },
+                    None => InOp::Call { func: *func, args },
+                };
+                if matches!(op, InOp::Call { .. }) {
+                    self.n_indirect += 1;
+                } else {
+                    self.n_inline += 1;
+                }
+                self.inner.push(op);
                 Src::Inner(self.inner.len() - 1)
             }
             FExpr::Binary { op, lhs, rhs } => {
@@ -304,7 +351,15 @@ impl<T: Elem> Builder<T> {
                 Src::Inner(_) => unreachable!("an empty nest has no innermost level"),
             }
         };
-        Kernel { dims, loads: self.loads, outer: self.outer, inner: self.inner, root }
+        Kernel {
+            dims,
+            loads: self.loads,
+            outer: self.outer,
+            inner: self.inner,
+            root,
+            n_inline: self.n_inline,
+            n_indirect: self.n_indirect,
+        }
     }
 }
 
@@ -319,6 +374,111 @@ fn bin_apply<T: Elem>(op: BinOp, a: T, b: T) -> T {
         BinOp::Sub => a - b,
         BinOp::Mul => a * b,
         BinOp::Div => a / b,
+    }
+}
+
+/// Reinterpret a block as `U`, if `T` really is `U`.
+///
+/// The same device as `jit_route::as_f32_slice`, for the same reason: the
+/// tape is generic over the element type but the transcendental built-ins
+/// only exist for the concrete float types, and a generic `fn(&[T]) -> T`
+/// call is exactly what we are trying to get rid of.
+#[inline]
+fn cast_slice<T: 'static, U: 'static>(s: &[T]) -> Option<&[U]> {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<U>() {
+        return None;
+    }
+    // SAFETY: `T == U` by the `TypeId` check, so the layouts, alignments
+    // and validity invariants are the same and the result borrows exactly
+    // the input's memory for the input's lifetime.
+    Some(unsafe { std::slice::from_raw_parts(s.as_ptr() as *const U, s.len()) })
+}
+
+#[inline]
+fn cast_slice_mut<T: 'static, U: 'static>(s: &mut [T]) -> Option<&mut [U]> {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<U>() {
+        return None;
+    }
+    // SAFETY: as `cast_slice`, and the exclusive borrow is preserved.
+    Some(unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut U, s.len()) })
+}
+
+/// Apply a float-only built-in over a block, monomorphized to the concrete
+/// element type so the call is direct (and, for `sqrt`/`abs`, an
+/// instruction the loop can be vectorized around).
+///
+/// `g32`/`g64` are generic parameters, not `fn` pointers, so each
+/// instantiation inlines one concrete function — using `fn(f32) -> f32`
+/// here would just trade one indirect call for another. `f` is the
+/// registry's own evaluator, used for element types that have no inline
+/// form (none today: these kinds are registered for `f32`/`f64` only).
+#[inline]
+fn float_block<T: Elem>(
+    x: &[T],
+    dst: &mut [T],
+    f: fn(&[T]) -> T,
+    g32: impl Fn(f32) -> f32,
+    g64: impl Fn(f64) -> f64,
+) {
+    if let Some(src) = cast_slice::<T, f32>(x) {
+        let out = cast_slice_mut::<T, f32>(dst).expect("T is f32");
+        for (d, s) in out.iter_mut().zip(src) {
+            *d = g32(*s);
+        }
+    } else if let Some(src) = cast_slice::<T, f64>(x) {
+        let out = cast_slice_mut::<T, f64>(dst).expect("T is f64");
+        for (d, s) in out.iter_mut().zip(src) {
+            *d = g64(*s);
+        }
+    } else {
+        for (d, s) in dst.iter_mut().zip(x) {
+            *d = f(std::slice::from_ref(s));
+        }
+    }
+}
+
+/// Apply one built-in unary over a block.
+///
+/// **Every arm must be bit-identical to the [`super::FnDef::eval`] its
+/// [`FnKind`] tags** — that is the whole contract of the tag. `Neg` and
+/// `Relu` are written generically in exactly the form `super::fn_neg` /
+/// the `relu` registration use (`T::ZERO` *is* `+0.0` for both float
+/// types, so `relu(-0.0) == +0.0` and `relu(NaN) == +0.0` here too); the
+/// rest delegate to the same `f32`/`f64` methods the registry entries call.
+fn unary_block<T: Elem>(kind: FnKind, f: fn(&[T]) -> T, x: &[T], dst: &mut [T]) {
+    match kind {
+        FnKind::Neg => {
+            for (d, s) in dst.iter_mut().zip(x) {
+                *d = -*s;
+            }
+        }
+        FnKind::Relu => {
+            for (d, s) in dst.iter_mut().zip(x) {
+                *d = if *s > T::ZERO { *s } else { T::ZERO };
+            }
+        }
+        FnKind::Exp => float_block(x, dst, f, f32::exp, f64::exp),
+        FnKind::Ln => float_block(x, dst, f, f32::ln, f64::ln),
+        FnKind::Sqrt => float_block(x, dst, f, f32::sqrt, f64::sqrt),
+        FnKind::Abs => float_block(x, dst, f, f32::abs, f64::abs),
+        FnKind::Tanh => float_block(x, dst, f, f32::tanh, f64::tanh),
+        // Arity 2: the builder emits `InOp::MaxMin` for these instead.
+        FnKind::Max2 | FnKind::Min2 => unreachable!("arity-2 built-in is not a unary block op"),
+    }
+}
+
+/// Elementwise `max`/`min` over two blocks, in the comparison form the
+/// registry's `fn_max2`/`fn_min2` use — *not* `f32::max`, which differs on
+/// `±0.0` and NaN.
+fn maxmin_block<T: Elem>(is_max: bool, x: &[T], y: &[T], dst: &mut [T]) {
+    if is_max {
+        for (d, (a, b)) in dst.iter_mut().zip(x.iter().zip(y)) {
+            *d = if *b > *a { *b } else { *a };
+        }
+    } else {
+        for (d, (a, b)) in dst.iter_mut().zip(x.iter().zip(y)) {
+            *d = if *b < *a { *b } else { *a };
+        }
     }
 }
 
@@ -452,6 +612,15 @@ fn run_inner<T: Elem>(
                     }
                 }
             }
+            InOp::Un { kind, func, a } => {
+                unary_block(*kind, reg.fns[*func].eval, &prev[a * BLOCK..a * BLOCK + len], dst);
+            }
+            InOp::MaxMin { is_max, a, b } => maxmin_block(
+                *is_max,
+                &prev[a * BLOCK..a * BLOCK + len],
+                &prev[b * BLOCK..b * BLOCK + len],
+                dst,
+            ),
             InOp::Call { func, args } => {
                 let f = reg.fns[*func].eval;
                 r.args.clear();
@@ -505,9 +674,45 @@ fn exec_map<T: Elem>(
     }
 }
 
+/// Apply a **store map** — a chain of arity-1 registry functions, left to
+/// right — over a reduction's finished output buffer, in place.
+///
+/// Exactly one application per output element, on the same value the
+/// unfused lowering would have mapped, and in the same order relative to
+/// the fold (the oracle also completes the whole reduction before its
+/// enclosing expression maps it). What is saved is the intermediate buffer
+/// and the extra kernel: this walks the result once, in blocks, so a
+/// built-in gets the same inline, vectorizable code it would have got from
+/// the map kernel.
+fn apply_store_maps<T: Elem>(
+    reg: &Registry<T>,
+    maps: &[usize],
+    buf: &mut [T],
+    scratch: &mut Vec<T>,
+) {
+    for &f in maps {
+        let eval = reg.fns[f].eval;
+        match reg.builtin_fn(f) {
+            Some(kind) if kind.arity() == 1 => {
+                for chunk in buf.chunks_mut(BLOCK) {
+                    scratch.clear();
+                    scratch.extend_from_slice(chunk);
+                    unary_block(kind, eval, scratch, chunk);
+                }
+            }
+            _ => {
+                for v in buf.iter_mut() {
+                    *v = eval(std::slice::from_ref(v));
+                }
+            }
+        }
+    }
+}
+
 /// Fold a reduction. Levels `0..n_free` are the free indices (one
 /// accumulator each, in ascending-id row-major order); the rest are the
 /// bound indices in binder order, innermost last.
+///
 #[allow(clippy::too_many_arguments)]
 fn exec_reduce<T: Elem>(
     k: &Kernel<T>,
@@ -574,6 +779,20 @@ pub struct RunReport {
     pub jit_reductions: usize,
     /// Reduction nodes run by the blocked tape kernel.
     pub tape_reductions: usize,
+    /// Reduction nodes whose enclosing unary chain became a **store map**:
+    /// applied to the reduction's own output buffer rather than turned
+    /// into a separate temporary plus a separate map kernel.
+    pub store_maps: usize,
+    /// Input loads carrying a unary chain fused into a JIT'd contraction
+    /// (a **load map**), counted per mapped leaf.
+    pub jit_load_maps: usize,
+    /// Store maps handed to the JIT rather than applied on the tape.
+    pub jit_store_maps: usize,
+    /// Built-in scalar functions compiled to inline block code on the
+    /// tape, and calls left as an indirect `fn(&[T]) -> T` per element
+    /// (a caller-registered function, always).
+    pub inline_fn_ops: usize,
+    pub indirect_fn_ops: usize,
 }
 
 impl RunReport {
@@ -628,10 +847,32 @@ impl<'a, T: Elem> Fast<'a, T> {
                     strides: strides_of(&self.shapes[buf]),
                 }
             }
-            CExpr::Call { func, args } => FExpr::Call {
-                func: *func,
-                args: args.iter().map(|a| self.lower(a, name_buf)).collect(),
-            },
+            CExpr::Call { .. } => {
+                // A unary chain wrapping a reduction is a **store map**:
+                // `sqrt(sum(l: M[l,j]))` applies `sqrt` once per element of
+                // the reduction's own result, so it belongs to the
+                // reduction, not to the expression around it. Same
+                // function, same arguments, same number of calls, same
+                // order — the temporary and the extra kernel disappear
+                // (and on the JIT it is emitted before the single store).
+                if let CExpr::Reduce { op, indices, body } = unary_chain_target(e) {
+                    let body = self.lower(body, name_buf);
+                    let free = free_ids(&body, indices);
+                    // The chain is peeled outermost-first; applying it to
+                    // the accumulator runs innermost-first.
+                    let mut maps = unary_chain_funcs(e);
+                    maps.reverse();
+                    let buf = self.reduce(*op, indices, &free, &body, &maps);
+                    self.report.store_maps += 1;
+                    let strides = strides_of(&self.shapes[buf]);
+                    return FExpr::Load { buf, indices: free, strides };
+                }
+                let CExpr::Call { func, args } = e else { unreachable!("matched above") };
+                FExpr::Call {
+                    func: *func,
+                    args: args.iter().map(|a| self.lower(a, name_buf)).collect(),
+                }
+            }
             CExpr::Binary { op, lhs, rhs } => FExpr::Binary {
                 op: *op,
                 lhs: Box::new(self.lower(lhs, name_buf)),
@@ -639,31 +880,46 @@ impl<'a, T: Elem> Fast<'a, T> {
             },
             CExpr::Reduce { op, indices, body } => {
                 let body = self.lower(body, name_buf);
-                let mut free = Vec::new();
-                body.collect_ids(&mut free);
-                free.retain(|id| !indices.contains(id));
-                free.sort_unstable();
-                free.dedup();
-                let buf = self.reduce(*op, indices, &free, &body);
+                let free = free_ids(&body, indices);
+                let buf = self.reduce(*op, indices, &free, &body, &[]);
                 let strides = strides_of(&self.shapes[buf]);
                 FExpr::Load { buf, indices: free, strides }
             }
         }
     }
 
-    /// Materialize one reduction node into a fresh buffer.
-    fn reduce(&mut self, op: usize, bound: &[IndexId], free: &[IndexId], body: &FExpr<T>) -> usize {
+    /// Roll a compiled kernel's inline/indirect call counts into the report.
+    fn account(&mut self, k: &Kernel<T>) {
+        self.report.inline_fn_ops += k.n_inline;
+        self.report.indirect_fn_ops += k.n_indirect;
+    }
+
+    /// Materialize one reduction node into a fresh buffer, applying
+    /// `store_maps` to each accumulator at the flush.
+    fn reduce(
+        &mut self,
+        op: usize,
+        bound: &[IndexId],
+        free: &[IndexId],
+        body: &FExpr<T>,
+        store_maps: &[usize],
+    ) -> usize {
         let shape: Vec<usize> = free.iter().map(|&i| self.extents[i as usize]).collect();
 
         #[cfg(feature = "jit")]
-        if let Some(data) = self.try_jit(op, bound, free, body, &shape) {
+        if let Some((data, n_load_maps, has_store_map)) =
+            self.try_jit(op, bound, free, body, store_maps, &shape)
+        {
             self.report.jit_reductions += 1;
+            self.report.jit_load_maps += n_load_maps;
+            self.report.jit_store_maps += usize::from(has_store_map);
             return self.push(data, shape);
         }
 
         let levels: Vec<IndexId> = free.iter().chain(bound).copied().collect();
         let dims: Vec<usize> = levels.iter().map(|&i| self.extents[i as usize]).collect();
-        let kernel = Builder::new(&levels, self.n_ids).finish(body, dims);
+        let kernel = Builder::new(&levels, self.n_ids, &self.reg.fn_kind).finish(body, dims);
+        self.account(&kernel);
 
         let rdef = &self.reg.reduces[op];
         let (identity, fold) = (rdef.identity, rdef.fold);
@@ -680,9 +936,47 @@ impl<'a, T: Elem> Fast<'a, T> {
             &mut out,
         );
         drop(slices);
+        apply_store_maps(self.reg, store_maps, &mut out, &mut self.regs.args);
         self.report.tape_reductions += 1;
         self.push(out, shape)
     }
+}
+
+/// Free indices of a reduction body: everything it reads that the binder
+/// does not bind, ascending — the temporary's axis order.
+fn free_ids<T>(body: &FExpr<T>, bound: &[IndexId]) -> Vec<IndexId> {
+    let mut free = Vec::new();
+    body.collect_ids(&mut free);
+    free.retain(|id| !bound.contains(id));
+    free.sort_unstable();
+    free.dedup();
+    free
+}
+
+/// Look through a chain of single-argument calls: the first node that is
+/// not one. Allocation-free, so the overwhelmingly common "this call does
+/// not wrap a reduction" answer costs nothing.
+fn unary_chain_target(e: &CExpr) -> &CExpr {
+    let mut cur = e;
+    while let CExpr::Call { func: _, args } = cur
+        && args.len() == 1
+    {
+        cur = &args[0];
+    }
+    cur
+}
+
+/// The function ids of that chain, outermost-first.
+fn unary_chain_funcs(e: &CExpr) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut cur = e;
+    while let CExpr::Call { func, args } = cur
+        && args.len() == 1
+    {
+        chain.push(*func);
+        cur = &args[0];
+    }
+    chain
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -691,13 +985,27 @@ impl<'a, T: Elem> Fast<'a, T> {
 
 #[cfg(feature = "jit")]
 mod jit_route {
-    use super::{Elem, FExpr, IndexId};
+    use super::{Elem, FExpr, FnKind, IndexId};
     use crate::dense::Dense;
     use crate::einsum::{Combine, Reduce};
-    use crate::jit::{EinsumF32Jit, JitInput};
+    use crate::jit::{EinsumF32Jit, JitInput, UnaryMap};
     use std::any::{Any, TypeId};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// The built-ins this backend can emit *exactly* — see
+    /// [`UnaryMap`]'s table. `exp`/`ln`/`tanh` are absent on purpose:
+    /// emitting them would need a libcall whose rounding we cannot pin to
+    /// the `libm` the tape uses, so a mapped `exp` stays on the tape.
+    pub(super) fn jit_map(kind: FnKind) -> Option<UnaryMap> {
+        Some(match kind {
+            FnKind::Neg => UnaryMap::Neg,
+            FnKind::Abs => UnaryMap::Abs,
+            FnKind::Sqrt => UnaryMap::Sqrt,
+            FnKind::Relu => UnaryMap::Relu,
+            _ => return None,
+        })
+    }
 
     /// Reinterpret `s` as `&[f32]` — `None` unless `T` really is `f32`.
     pub(super) fn as_f32_slice<T: 'static>(s: &[T]) -> Option<&[f32]> {
@@ -724,6 +1032,8 @@ mod jit_route {
         pub out_shape: Vec<usize>,
         pub reduce: Reduce,
         pub combine: Combine,
+        pub load_maps: Vec<Vec<UnaryMap>>,
+        pub store_map: Vec<UnaryMap>,
     }
 
     thread_local! {
@@ -747,15 +1057,19 @@ mod jit_route {
             if let Some((_, hit)) = c.borrow().iter().find(|(k, _)| *k == key) {
                 return hit.clone();
             }
-            let built = EinsumF32Jit::compile_reduce(
+            let loads: Vec<&[UnaryMap]> = key.load_maps.iter().map(|m| m.as_slice()).collect();
+            let built = EinsumF32Jit::compile_reduce_mapped(
                 &key.spec,
                 key.reduce,
                 key.combine,
+                &loads,
+                &key.store_map,
                 inputs,
                 &[out_shape.to_vec()],
             )
             .ok()
             .map(Rc::new);
+            drop(loads);
             let mut c = c.borrow_mut();
             if c.len() >= CACHE_CAP {
                 let half = c.len() / 2;
@@ -778,19 +1092,46 @@ mod jit_route {
         out.data
     }
 
-    /// A left-leaning chain `((l₀ ⊗ l₁) ⊗ l₂) ⊗ …` of tensor loads under a
-    /// single `*` or `+`, or a bare load. Returns the leaves in the order
-    /// the backend combines them (`emit_contribution` folds left to right
-    /// in input order, so any other association would change the bits).
+    /// One operand of a contraction: a tensor load, plus the **load map**
+    /// applied to every element as it is read.
+    pub(super) struct Leaf<'e> {
+        pub indices: &'e [IndexId],
+        pub buf: usize,
+        /// Built-in unaries wrapping the load, in application order.
+        pub maps: Vec<UnaryMap>,
+    }
+
+    /// A left-leaning chain `((l₀ ⊗ l₁) ⊗ l₂) ⊗ …` under a single `*` or
+    /// `+`, or a lone operand. Returns the leaves in the order the backend
+    /// combines them (`emit_contribution` folds left to right in input
+    /// order, so any other association would change the bits).
+    ///
+    /// Each leaf is a tensor load optionally wrapped in built-in unaries —
+    /// `sum(j: relu(a[i,j]) * b[j,k])` is still one contraction, with
+    /// `relu` fused into the load. The map must be one the JIT emits
+    /// exactly ([`jit_map`]); anything else declines and stays on the tape.
     ///
     /// Every leaf must carry at least one index (the spec parser rejects an
     /// empty input pattern) and no index twice (a diagonal read has no
     /// einsum-input form here).
-    pub(super) fn flatten_chain<T: Elem>(
-        e: &FExpr<T>,
-    ) -> Option<(Combine, Vec<(&[IndexId], usize)>)> {
-        fn leaf<T: Elem>(e: &FExpr<T>) -> Option<(&[IndexId], usize)> {
-            let FExpr::Load { buf, indices, .. } = e else { return None };
+    pub(super) fn flatten_chain<'e, T: Elem>(
+        e: &'e FExpr<T>,
+        kinds: &[Option<FnKind>],
+    ) -> Option<(Combine, Vec<Leaf<'e>>)> {
+        fn leaf<'e, T: Elem>(e: &'e FExpr<T>, kinds: &[Option<FnKind>]) -> Option<Leaf<'e>> {
+            // Peel the unary wrappers outermost-first; they apply to the
+            // loaded value innermost-first.
+            let mut maps = Vec::new();
+            let mut cur = e;
+            while let FExpr::Call { func, args } = cur
+                && args.len() == 1
+            {
+                maps.push(jit_map(kinds[*func]?)?);
+                cur = &args[0];
+            }
+            maps.reverse();
+
+            let FExpr::Load { buf, indices, .. } = cur else { return None };
             if indices.is_empty() {
                 return None;
             }
@@ -799,19 +1140,20 @@ mod jit_route {
                     return None;
                 }
             }
-            Some((indices.as_slice(), *buf))
+            Some(Leaf { indices: indices.as_slice(), buf: *buf, maps })
         }
 
         fn walk<'e, T: Elem>(
             e: &'e FExpr<T>,
             want: super::BinOp,
-            out: &mut Vec<(&'e [IndexId], usize)>,
+            kinds: &[Option<FnKind>],
+            out: &mut Vec<Leaf<'e>>,
         ) -> bool {
             if let FExpr::Binary { op, lhs, rhs } = e
                 && *op == want
             {
-                return walk(lhs, want, out)
-                    && match leaf(rhs) {
+                return walk(lhs, want, kinds, out)
+                    && match leaf(rhs, kinds) {
                         Some(l) => {
                             out.push(l);
                             true
@@ -819,7 +1161,7 @@ mod jit_route {
                         None => false,
                     };
             }
-            match leaf(e) {
+            match leaf(e, kinds) {
                 Some(l) => {
                     out.push(l);
                     true
@@ -829,9 +1171,6 @@ mod jit_route {
         }
 
         match e {
-            // Single operand: the combine never fires, so its choice is
-            // immaterial.
-            FExpr::Load { .. } => Some((Combine::Mul, vec![leaf(e)?])),
             FExpr::Binary { op, .. } => {
                 let combine = match op {
                     super::BinOp::Mul => Combine::Mul,
@@ -839,9 +1178,11 @@ mod jit_route {
                     _ => return None,
                 };
                 let mut leaves = Vec::new();
-                walk(e, *op, &mut leaves).then_some((combine, leaves))
+                walk(e, *op, kinds, &mut leaves).then_some((combine, leaves))
             }
-            _ => None,
+            // A lone operand (possibly mapped): the combine never fires,
+            // so its choice is immaterial.
+            _ => Some((Combine::Mul, vec![leaf(e, kinds)?])),
         }
     }
 }
@@ -855,16 +1196,18 @@ impl<T: Elem> Fast<'_, T> {
     /// tree-walker (see the module docs). Returns `None` — silently, having
     /// computed nothing — whenever one does not hold; the blocked tape
     /// kernel then walks the same nest itself.
+    #[allow(clippy::too_many_arguments)]
     fn try_jit(
         &self,
         op: usize,
         bound: &[IndexId],
         free: &[IndexId],
         body: &FExpr<T>,
+        store_maps: &[usize],
         out_shape: &[usize],
-    ) -> Option<Vec<T>> {
+    ) -> Option<(Vec<T>, usize, bool)> {
         use crate::einsum::Reduce;
-        use crate::jit::JitInput;
+        use crate::jit::{JitInput, UnaryMap};
 
         // ── f32 only: that is the backend's element type. ──
         if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f32>() {
@@ -880,14 +1223,21 @@ impl<T: Elem> Fast<'_, T> {
             return None;
         }
 
-        // ── Body must be a left-leaning chain of tensor loads. ──
-        let (combine, leaves) = jit_route::flatten_chain(body)?;
+        // ── An enclosing unary chain becomes the store map, but only if
+        // this backend emits every link of it exactly. ──
+        let store_map: Vec<UnaryMap> = store_maps
+            .iter()
+            .map(|&f| self.reg.builtin_fn(f).and_then(jit_route::jit_map))
+            .collect::<Option<_>>()?;
+
+        // ── Body must be a left-leaning chain of (possibly mapped) loads. ──
+        let (combine, leaves) = jit_route::flatten_chain(body, &self.reg.fn_kind)?;
 
         // ── Assign a spec letter per index, in first-appearance order. ──
         let mut slot_of: HashMap<IndexId, u8> = HashMap::new();
         let mut appearance: Vec<IndexId> = Vec::new();
-        for (indices, _) in &leaves {
-            for &id in *indices {
+        for leaf in &leaves {
+            for &id in leaf.indices {
                 if !slot_of.contains_key(&id) {
                     let n = slot_of.len();
                     if n >= 26 {
@@ -917,28 +1267,44 @@ impl<T: Elem> Fast<'_, T> {
         };
         let spec = format!(
             "{}->{}",
-            leaves.iter().map(|(ix, _)| letters(ix)).collect::<Vec<_>>().join(","),
+            leaves.iter().map(|l| letters(l.indices)).collect::<Vec<_>>().join(","),
             letters(free)
         );
 
         let bufs = self.slices();
         let mut inputs: Vec<JitInput> = Vec::with_capacity(leaves.len());
         let mut in_shapes: Vec<Vec<usize>> = Vec::with_capacity(leaves.len());
-        for (indices, buf) in &leaves {
-            let data = jit_route::as_f32_slice(bufs[*buf])?;
-            let shape = self.shapes[*buf].clone();
-            debug_assert_eq!(shape.len(), indices.len());
+        for leaf in &leaves {
+            let data = jit_route::as_f32_slice(bufs[leaf.buf])?;
+            let shape = self.shapes[leaf.buf].clone();
+            debug_assert_eq!(shape.len(), leaf.indices.len());
             in_shapes.push(shape.clone());
             inputs.push(JitInput::DenseSlice { data, shape });
         }
+        // An empty `load_maps` *is* "no maps" for the backend, so an
+        // unmapped contraction — the common case — stays exactly as cheap
+        // to key and compile as it was before load maps existed.
+        let n_mapped = leaves.iter().filter(|l| !l.maps.is_empty()).count();
+        let load_maps: Vec<Vec<UnaryMap>> = if n_mapped == 0 {
+            Vec::new()
+        } else {
+            leaves.iter().map(|l| l.maps.clone()).collect()
+        };
+        let n_store = store_map.len();
 
-        let key =
-            jit_route::Key { spec, in_shapes, out_shape: out_shape.to_vec(), reduce, combine };
+        let key = jit_route::Key {
+            spec,
+            in_shapes,
+            out_shape: out_shape.to_vec(),
+            reduce,
+            combine,
+            load_maps,
+            store_map,
+        };
         let jit = jit_route::compiled(key, &inputs, out_shape)?;
         let identity = if reduce == Reduce::Sum { 0.0f32 } else { 1.0f32 };
-        Some(jit_route::from_f32_vec(jit_route::run_into(
-            &jit, &inputs, out_shape, identity,
-        )))
+        let out = jit_route::run_into(&jit, &inputs, out_shape, identity);
+        Some((jit_route::from_f32_vec(out), n_mapped, n_store > 0))
     }
 }
 
@@ -995,7 +1361,9 @@ pub(super) fn try_run<T: Elem>(
         let buf = match &rhs {
             FExpr::Load { buf, indices, .. } if *indices == stmt.lhs => *buf,
             _ => {
-                let kernel = Builder::new(&stmt.lhs, n_ids).finish(&rhs, shape.clone());
+                let kernel =
+                    Builder::new(&stmt.lhs, n_ids, &reg.fn_kind).finish(&rhs, shape.clone());
+                f.account(&kernel);
                 let mut out = vec![T::ZERO; elem_count(&shape)];
                 let slices: Vec<&[T]> = f.bufs.iter().map(|b| b.as_slice()).collect();
                 exec_map(&kernel, &slices, reg, &mut f.regs, &mut out);

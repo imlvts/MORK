@@ -105,7 +105,7 @@
 use std::fmt;
 use std::mem;
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlags, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -146,6 +146,43 @@ impl fmt::Display for JitError {
 }
 
 impl std::error::Error for JitError {}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Load / store maps
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An elementwise unary applied *inside* a compiled contraction: to an
+/// input value as it is loaded (a **load map**), or to the finished
+/// accumulator just before it is stored (a **store map**). Fusing these
+/// into the kernel is what turns `sqrt(sum(j: relu(a[i,j]) * b[j]))` into
+/// a single loop nest with no intermediate buffers.
+///
+/// Deliberately restricted to unaries that lower to a *single, exactly
+/// specified* float operation, so a mapped kernel is bit-identical to
+/// applying the same function elementwise in Rust:
+///
+/// | variant | emitted | Rust equivalent |
+/// |---|---|---|
+/// | `Neg`  | `fneg` (sign-bit flip) | `-x` |
+/// | `Abs`  | `fabs` (sign-bit clear) | `x.abs()` |
+/// | `Sqrt` | `sqrt` (IEEE, correctly rounded) | `x.sqrt()` |
+/// | `Relu` | `select(x > 0.0, x, +0.0)` | `if x > 0.0 { x } else { 0.0 }` |
+///
+/// Transcendentals (`exp`, `ln`, `tanh`) are *not* here: they would need a
+/// libcall whose rounding this backend cannot pin to the host `libm` the
+/// rest of the program uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryMap {
+    /// `-x`.
+    Neg,
+    /// `|x|`.
+    Abs,
+    /// `√x` (`NaN` for a negative argument, `-0.0` for `-0.0`).
+    Sqrt,
+    /// `max(x, 0)` written as `if x > 0.0 { x } else { 0.0 }` — so
+    /// `relu(-0.0)` and `relu(NaN)` are both `+0.0`.
+    Relu,
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public input handle
@@ -378,6 +415,39 @@ impl EinsumF32Jit {
         inputs: &[JitInput],
         output_shapes: &[Vec<usize>],
     ) -> Result<Self, JitError> {
+        Self::compile_reduce_mapped(spec, reduce, combine, &[], &[], inputs, output_shapes)
+    }
+
+    /// [`compile_reduce`](Self::compile_reduce) with elementwise
+    /// [`UnaryMap`] chains fused into the loop nest.
+    ///
+    /// - `load_maps` is either empty (no maps) or one chain per input,
+    ///   applied left to right to each value as it is loaded.
+    /// - `store_map` is applied left to right to the finished accumulator
+    ///   immediately before the single store per output element.
+    ///
+    /// Restrictions, both reported as [`JitError::Unsupported`]:
+    ///
+    /// - a **store map** needs the register-accumulator loop nest, i.e. all
+    ///   inputs dense and exactly one output — otherwise outputs are
+    ///   read-modify-written and the map would be re-applied per
+    ///   contraction step;
+    /// - a **load map** on a sparse input is rejected outright: sparse
+    ///   iteration skips structural zeros, so fusing `f` would silently
+    ///   substitute `0` for `f(0)` on every skipped entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_reduce_mapped(
+        spec: &str,
+        reduce: Reduce,
+        combine: Combine,
+        load_maps: &[&[UnaryMap]],
+        store_map: &[UnaryMap],
+        inputs: &[JitInput],
+        output_shapes: &[Vec<usize>],
+    ) -> Result<Self, JitError> {
+        if !load_maps.is_empty() && load_maps.len() != inputs.len() {
+            return Err(JitError::Unsupported("load_maps must be empty or one chain per input"));
+        }
         let parsed = parse_spec(spec, inputs.len())?;
         let in_shapes: Vec<Vec<usize>> = inputs.iter().map(|i| i.shape()).collect();
         let is_sparse: Vec<bool> = inputs.iter().map(|i| i.is_sparse()).collect();
@@ -441,8 +511,18 @@ impl EinsumF32Jit {
             }
         }
 
-        let (module, func) =
-            codegen(&parsed.inputs, &parsed.outputs, &is_sparse, &dims, reduce, combine)?;
+        let no_maps: Vec<&[UnaryMap]> = vec![&[]; inputs.len()];
+        let load_maps = if load_maps.is_empty() { &no_maps[..] } else { load_maps };
+        let (module, func) = codegen(
+            &parsed.inputs,
+            &parsed.outputs,
+            &is_sparse,
+            &dims,
+            reduce,
+            combine,
+            load_maps,
+            store_map,
+        )?;
 
         Ok(Self {
             module: Some(module),
@@ -860,10 +940,36 @@ fn emit_reduce(b: &mut FunctionBuilder, reduce: Reduce, acc: Value, v: Value) ->
     }
 }
 
+/// Emit one [`UnaryMap`], as the doc table on that type specifies.
+fn emit_map(b: &mut FunctionBuilder, map: UnaryMap, v: Value) -> Value {
+    match map {
+        UnaryMap::Neg => b.ins().fneg(v),
+        UnaryMap::Abs => b.ins().fabs(v),
+        UnaryMap::Sqrt => b.ins().sqrt(v),
+        UnaryMap::Relu => {
+            // `if x > 0.0 { x } else { 0.0 }`: an *ordered* compare, so
+            // NaN takes the else branch and yields +0.0 — same as the Rust
+            // form, and unlike `fmax`.
+            let zero = b.ins().f32const(0.0);
+            let gt = b.ins().fcmp(FloatCC::GreaterThan, v, zero);
+            b.ins().select(gt, v, zero)
+        }
+    }
+}
+
+/// Emit a whole map chain, left to right.
+fn emit_map_chain(b: &mut FunctionBuilder, maps: &[UnaryMap], mut v: Value) -> Value {
+    for &m in maps {
+        v = emit_map(b, m, v);
+    }
+    v
+}
+
 /// Emit the combine ⊗ of all input elements at the current index values
-/// (left-to-right in input order). Dense inputs are loaded by computed
-/// address; sparse-covered inputs read their cached per-iteration value
-/// variable.
+/// (left-to-right in input order), each first passed through its load-map
+/// chain. Dense inputs are loaded by computed address; sparse-covered
+/// inputs read their cached per-iteration value variable.
+#[allow(clippy::too_many_arguments)]
 fn emit_contribution(
     b: &mut FunctionBuilder,
     ptr_ty: Type,
@@ -872,6 +978,7 @@ fn emit_contribution(
     bases: &[InputBase],
     val_vars: &[Option<Variable>],
     vars: &[Variable; 26],
+    load_maps: &[&[UnaryMap]],
 ) -> Value {
     let mut contrib: Option<Value> = None;
     for (i, pattern) in inputs.iter().enumerate() {
@@ -888,6 +995,7 @@ fn emit_contribution(
                 InputBase::Row { .. } => unreachable!("row input must be sparse-covered"),
             }
         };
+        let v = emit_map_chain(b, load_maps[i], v);
         contrib = Some(match contrib {
             None => v,
             Some(p) => match combine {
@@ -914,6 +1022,7 @@ fn new_module() -> JITModule {
 }
 
 /// Generate native code for `inputs -> outputs` with the given per-slot dims.
+#[allow(clippy::too_many_arguments)]
 fn codegen(
     inputs: &[Vec<u8>],
     outputs: &[Vec<u8>],
@@ -921,8 +1030,27 @@ fn codegen(
     dims: &[usize; 26],
     reduce: Reduce,
     combine: Combine,
+    load_maps: &[&[UnaryMap]],
+    store_map: &[UnaryMap],
 ) -> Result<(JITModule, extern "C" fn(*const *const u8, *const *mut u8)), JitError> {
     let any_sparse = is_sparse.iter().any(|&c| c);
+
+    // A load map on a sparse input would be applied only to the *stored*
+    // entries; every skipped structural zero would contribute 0 where the
+    // dense-equivalent contributes f(0). Reject rather than silently
+    // restrict this to zero-preserving maps.
+    if is_sparse.iter().zip(load_maps).any(|(&sp, m)| sp && !m.is_empty()) {
+        return Err(JitError::Unsupported("a load map on a sparse input skips structural zeros"));
+    }
+    // The store map is applied once, to a finished accumulator. That only
+    // exists in the register-accumulator nest below; the general path
+    // read-modify-writes the output, where the map would compound.
+    let register_acc = !any_sparse && outputs.len() == 1;
+    if !store_map.is_empty() && !register_acc {
+        return Err(JitError::Unsupported(
+            "a store map requires all-dense inputs and exactly one output",
+        ));
+    }
 
     // Sparse row iteration skips structural zeros, which is only sound for
     // sum-of-products (a zero factor annihilates the product and adding 0
@@ -1058,7 +1186,7 @@ fn codegen(
             .map(|i| b.ins().load(ptr_ty, MemFlags::trusted(), outs_ptr, i as i32 * ptr_bytes))
             .collect();
 
-        if !any_sparse && outputs.len() == 1 {
+        if register_acc {
             // ── All-dense single output: register accumulator. ──
             // for free: { acc = identity; for contracted { acc = acc ⊕ contrib }; out = acc }
             let mut free_loops = Vec::new();
@@ -1072,8 +1200,9 @@ fn codegen(
                 c_loops.push((vars[s as usize], open_dense_loop(&mut b, ptr_ty, vars[s as usize], dims[s as usize])));
             }
 
-            let contrib =
-                emit_contribution(&mut b, ptr_ty, combine, inputs, &bases, &val_vars, &vars);
+            let contrib = emit_contribution(
+                &mut b, ptr_ty, combine, inputs, &bases, &val_vars, &vars, load_maps,
+            );
             let cur = b.use_var(acc);
             let folded = emit_reduce(&mut b, reduce, cur, contrib);
             b.def_var(acc, folded);
@@ -1082,6 +1211,7 @@ fn codegen(
                 close_loop(&mut b, iv, h, e);
             }
             let acc_val = b.use_var(acc);
+            let acc_val = emit_map_chain(&mut b, store_map, acc_val);
             let idx_vals: Vec<Value> =
                 outputs[0].iter().map(|&s| b.use_var(vars[s as usize])).collect();
             let addr = out_layouts[0].emit_elem_addr(&mut b, ptr_ty, out_bases[0], &idx_vals);
@@ -1128,8 +1258,9 @@ fn codegen(
                 }
             }
 
-            let contrib =
-                emit_contribution(&mut b, ptr_ty, combine, inputs, &bases, &val_vars, &vars);
+            let contrib = emit_contribution(
+                &mut b, ptr_ty, combine, inputs, &bases, &val_vars, &vars, load_maps,
+            );
             for (oi, pattern) in outputs.iter().enumerate() {
                 let idx_vals: Vec<Value> =
                     pattern.iter().map(|&s| b.use_var(vars[s as usize])).collect();
@@ -1352,6 +1483,103 @@ mod tests {
         einsum_jit_reduce("iq->i", Reduce::Max, Combine::Mul, &[d(&a)], &mut [&mut m])
             .unwrap();
         assert_eq!(m.data, vec![f32::NEG_INFINITY; 2]);
+    }
+
+    // ── Load / store maps ──
+
+    /// A mapped contraction must equal applying the same unaries in Rust,
+    /// **bit for bit** — that is the whole premise of [`UnaryMap`].
+    #[test]
+    fn load_and_store_maps_match_scalar_rust() {
+        let a = dense(vec![2, 3], &[1., -2., 0., -0.0, 4., -5.]);
+        let b = dense(vec![3], &[-1., 2., -3.]);
+        let maps: [&[UnaryMap]; 2] = [&[UnaryMap::Relu], &[UnaryMap::Neg, UnaryMap::Abs]];
+        let mut out = Dense::<f32>::zeros(vec![2]);
+        let jit = EinsumF32Jit::compile_reduce_mapped(
+            "ab,b->a",
+            Reduce::Sum,
+            Combine::Mul,
+            &maps,
+            &[UnaryMap::Sqrt],
+            &[d(&a), d(&b)],
+            &[vec![2]],
+        )
+        .unwrap();
+        jit.run(&[d(&a), d(&b)], &mut [&mut out]);
+
+        let relu = |x: f32| if x > 0.0 { x } else { 0.0 };
+        for i in 0..2 {
+            let mut acc = 0.0f32;
+            for j in 0..3 {
+                acc += relu(a.data[i * 3 + j]) * (-b.data[j]).abs();
+            }
+            assert_eq!(out.data[i].to_bits(), acc.sqrt().to_bits(), "row {i}");
+        }
+    }
+
+    /// `relu` must be the `if x > 0.0 { x } else { 0.0 }` form: `-0.0` and
+    /// `NaN` both come out as `+0.0`, which `fmax(x, 0.0)` would not give.
+    #[test]
+    fn relu_map_normalizes_negative_zero_and_nan() {
+        let a = dense(vec![1, 2], &[-0.0, f32::NAN]);
+        let b = dense(vec![2], &[1.0, 1.0]);
+        let mut out = Dense::<f32>::zeros(vec![1]);
+        let jit = EinsumF32Jit::compile_reduce_mapped(
+            "ab,b->a",
+            Reduce::Sum,
+            Combine::Mul,
+            &[&[UnaryMap::Relu], &[]],
+            &[],
+            &[d(&a), d(&b)],
+            &[vec![1]],
+        )
+        .unwrap();
+        jit.run(&[d(&a), d(&b)], &mut [&mut out]);
+        assert_eq!(out.data[0].to_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn maps_rejected_where_they_would_be_unsound() {
+        let a = Csr::<u32, f32>::from_coo(3, &mut vec![(0, 1, 1.0), (1, 2, 1.0)]);
+        let x = dense(vec![3, 2], &[1., 2., 3., 4., 5., 6.]);
+        // A load map on a sparse input would silently skip `f(0)` on every
+        // structural zero.
+        let res = EinsumF32Jit::compile_reduce_mapped(
+            "ab,bc->ac",
+            Reduce::Sum,
+            Combine::Mul,
+            &[&[UnaryMap::Neg], &[]],
+            &[],
+            &[JitInput::Csr(&a), d(&x)],
+            &[vec![3, 2]],
+        );
+        assert!(matches!(res, Err(JitError::Unsupported(_))));
+
+        // A store map needs the register accumulator; the sparse nest
+        // read-modify-writes and would compound the map.
+        let res = EinsumF32Jit::compile_reduce_mapped(
+            "ab,bc->ac",
+            Reduce::Sum,
+            Combine::Mul,
+            &[],
+            &[UnaryMap::Sqrt],
+            &[JitInput::Csr(&a), d(&x)],
+            &[vec![3, 2]],
+        );
+        assert!(matches!(res, Err(JitError::Unsupported(_))));
+
+        // One chain per input, or none at all.
+        let y = dense(vec![2, 2], &[1., 2., 3., 4.]);
+        let res = EinsumF32Jit::compile_reduce_mapped(
+            "ab,bc->ac",
+            Reduce::Sum,
+            Combine::Mul,
+            &[&[UnaryMap::Abs]],
+            &[],
+            &[d(&y), d(&y)],
+            &[vec![2, 2]],
+        );
+        assert!(matches!(res, Err(JitError::Unsupported(_))));
     }
 
     #[test]
