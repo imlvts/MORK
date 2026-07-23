@@ -99,6 +99,12 @@ impl<T: Copy + Default> NDIndex<T> for Dense<T> {
             self.data[i] = v;
         }
     }
+    fn as_flat_slice(&self) -> Option<&[T]> {
+        Some(&self.data)
+    }
+    fn as_flat_slice_mut(&mut self) -> Option<&mut [T]> {
+        Some(&mut self.data)
+    }
 }
 
 #[cfg(test)]

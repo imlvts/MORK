@@ -92,6 +92,31 @@ pub trait NDIndex<T> {
     fn as_sparse_2d(&self) -> Option<&dyn Sparse2D<T>> {
         None
     }
+
+    /// Contiguous row-major storage backing this tensor, if it has any.
+    ///
+    /// The slice must be exactly the dense row-major (C-order) image of the
+    /// tensor: element `ix` lives at the linear offset
+    /// `Σ ix[k] · Π dim(k+1..)`, and the slice length is the product of all
+    /// dimensions (1 for rank 0). Returning `Some` is a promise that
+    /// `get(ix)` equals `as_flat_slice().unwrap()[linear(ix)]`.
+    ///
+    /// Default: `None` — formats without such an image (CSR, blocked)
+    /// simply don't implement it. Consumers use it to bypass per-element
+    /// `get` dispatch; the [`crate::lang`] kernel path requires it.
+    fn as_flat_slice(&self) -> Option<&[T]> {
+        None
+    }
+
+    /// Mutable counterpart of [`as_flat_slice`](Self::as_flat_slice), with
+    /// the same layout contract: writing `v` at the linear offset of `ix`
+    /// must be indistinguishable from `set(ix, v)`.
+    ///
+    /// An implementation may provide one and not the other; consumers must
+    /// handle `None` from either.
+    fn as_flat_slice_mut(&mut self) -> Option<&mut [T]> {
+        None
+    }
 }
 
 /// Extension of [`NDIndex`] for CSR-style sparse tensors.

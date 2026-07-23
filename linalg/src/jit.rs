@@ -203,19 +203,25 @@ impl<'a> SparseView<'a> {
 #[derive(Clone)]
 pub enum JitInput<'a> {
     Dense(&'a Dense<f32>),
+    /// A borrowed contiguous row-major buffer with an explicit shape —
+    /// the same layout as [`JitInput::Dense`], for callers that hold the
+    /// storage as a plain slice rather than an owning [`Dense`].
+    /// `data.len()` must equal the product of `shape` (1 for rank 0).
+    DenseSlice { data: &'a [f32], shape: Vec<usize> },
     Csr(&'a Csr<u32, f32>),
     Sparse(SparseView<'a>),
 }
 
 impl JitInput<'_> {
     fn is_sparse(&self) -> bool {
-        !matches!(self, JitInput::Dense(_))
+        !matches!(self, JitInput::Dense(_) | JitInput::DenseSlice { .. })
     }
 
     /// Logical einsum shape.
     fn shape(&self) -> Vec<usize> {
         match self {
             JitInput::Dense(d) => d.shape.clone(),
+            JitInput::DenseSlice { shape, .. } => shape.clone(),
             JitInput::Csr(c) => c.shape.clone(),
             JitInput::Sparse(v) => v.shape.clone(),
         }
@@ -226,6 +232,7 @@ impl JitInput<'_> {
     fn push_ptrs(&self, out: &mut Vec<*const u8>) {
         match self {
             JitInput::Dense(d) => out.push(d.data.as_ptr() as *const u8),
+            JitInput::DenseSlice { data, .. } => out.push(data.as_ptr() as *const u8),
             JitInput::Csr(c) => {
                 out.push(c.row_ptr.as_ptr() as *const u8);
                 out.push(c.col_idx.as_ptr() as *const u8);

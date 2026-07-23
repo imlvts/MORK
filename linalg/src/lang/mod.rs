@@ -50,12 +50,13 @@ use crate::tensor::Scalar;
 pub mod ast;
 mod check;
 mod eval;
+mod fast;
 mod parse;
 mod sexpr;
 
 pub use ast::{BinOp, Expr, Program, Stmt};
 pub use check::{Checked, check};
-pub use eval::run;
+pub use eval::{RunReport, run, run_reference, run_reported};
 pub use parse::parse;
 pub use sexpr::parse_sexpr;
 
@@ -69,11 +70,16 @@ pub use sexpr::parse_sexpr;
 /// the language exposes (`-`, `/`, unary negation). Blanket-implemented
 /// for every qualifying type — floats and signed integers out of the box;
 /// unsigned integers don't qualify (no `Neg`).
+///
+/// The `'static` bound lets the executor recognise `f32` at run time (via
+/// [`std::any::TypeId`]) and route eligible reductions to the JIT backend;
+/// every primitive numeric type satisfies it.
 pub trait Elem:
     Scalar
     + std::ops::Sub<Output = Self>
     + std::ops::Div<Output = Self>
     + std::ops::Neg<Output = Self>
+    + 'static
 {
 }
 
@@ -82,6 +88,7 @@ impl<T> Elem for T where
         + std::ops::Sub<Output = T>
         + std::ops::Div<Output = T>
         + std::ops::Neg<Output = T>
+        + 'static
 {
 }
 
@@ -130,6 +137,12 @@ pub struct Registry<T> {
     pub(crate) lit: fn(f64) -> T,
     pub(crate) fns: Vec<FnDef<T>>,
     pub(crate) reduces: Vec<ReduceDef<T>>,
+    /// Parallel to `reduces`: which built-in semiring operator an entry
+    /// *is*, for backends that speak [`crate::einsum::Reduce`] rather than
+    /// a fold pointer. Only [`Registry::new`] ever sets a `Some`, so a
+    /// user-registered reduction — even one named `"sum"` with an
+    /// identical fold — stays `None` and keeps the portable path.
+    pub(crate) reduce_kind: Vec<Option<crate::einsum::Reduce>>,
 }
 
 fn fold_sum<T: Elem>(a: T, b: T) -> T {
@@ -158,11 +171,21 @@ impl<T: Elem> Registry<T> {
     /// A registry with the built-in reductions and type-generic functions,
     /// converting literals via `lit`.
     pub fn new(lit: fn(f64) -> T) -> Self {
-        let mut r = Registry { lit, fns: Vec::new(), reduces: Vec::new() };
+        use crate::einsum::Reduce;
+        let mut r = Registry {
+            lit,
+            fns: Vec::new(),
+            reduces: Vec::new(),
+            reduce_kind: Vec::new(),
+        };
         r.register_reduce(ReduceDef { name: "sum", identity: T::ZERO, fold: fold_sum::<T> });
         r.register_reduce(ReduceDef { name: "prod", identity: T::ONE, fold: fold_prod::<T> });
         r.register_reduce(ReduceDef { name: "max", identity: T::LEAST, fold: fold_max::<T> });
         r.register_reduce(ReduceDef { name: "min", identity: T::GREATEST, fold: fold_min::<T> });
+        // The four just-registered entries occupy ids 0..4, in this order,
+        // with exactly `Reduce::identity`'s identities.
+        r.reduce_kind =
+            vec![Some(Reduce::Sum), Some(Reduce::Prod), Some(Reduce::Max), Some(Reduce::Min)];
         r.register_fn(FnDef { name: "neg", arity: 1, eval: fn_neg::<T>, zero_preserving: true });
         r.register_fn(FnDef { name: "max", arity: 2, eval: fn_max2::<T>, zero_preserving: true });
         r.register_fn(FnDef { name: "min", arity: 2, eval: fn_min2::<T>, zero_preserving: true });
@@ -189,6 +212,7 @@ impl<T: Elem> Registry<T> {
             def.name
         );
         self.reduces.push(def);
+        self.reduce_kind.push(None);
     }
 }
 
@@ -199,6 +223,12 @@ impl<T> Registry<T> {
 
     pub(crate) fn reduce_id(&self, name: &str) -> Option<usize> {
         self.reduces.iter().position(|r| r.name == name)
+    }
+
+    /// Which built-in semiring operator reduction `id` is, if any. See
+    /// [`Registry::reduce_kind`].
+    pub(crate) fn builtin_reduce(&self, id: usize) -> Option<crate::einsum::Reduce> {
+        self.reduce_kind[id]
     }
 }
 
