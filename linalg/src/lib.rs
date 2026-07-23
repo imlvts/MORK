@@ -16,6 +16,10 @@
 //!   reductions over any ([`Reduce`](einsum::Reduce),
 //!   [`Combine`](einsum::Combine)) semiring — max-product, min-plus, … —
 //!   via [`einsum_reduce`](einsum::einsum_reduce).
+//! - [`lang`] (feature `dense`) — the tensor-expression language:
+//!   pointwise arithmetic, scalar functions, and explicitly-bound
+//!   reductions (`soft[i] = exp(v[i]) / sum(j: exp(v[j]))`), with infix
+//!   and s-expression front-ends. See `LANGUAGE.md`.
 //!
 //! # Quick example: CSR × Dense via einsum
 //!
@@ -61,6 +65,9 @@ pub mod csr;
 pub mod blocked;
 
 pub mod einsum;
+
+#[cfg(feature = "dense")]
+pub mod lang;
 
 #[cfg(feature = "csr")]
 pub mod any;
