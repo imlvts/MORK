@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use linalg::dense::Dense;
 use linalg::einsum::einsum_homogenous;
-use linalg::lang::{Checked, Registry, check, parse, run};
+use linalg::lang::{Checked, Registry, RunOptions, check, parse, run, run_with};
 use linalg::tensor::NDIndex;
 
 // ─── timing ─────────────────────────────────────────────────────────────
@@ -476,6 +476,76 @@ fn section_multi_statement(bad: &mut Vec<String>) {
 
 // ─── main ───────────────────────────────────────────────────────────────
 
+// ─── 5. dynamic axes (RESUME step 6) ────────────────────────────────────
+
+/// What a *runtime* extent costs on a hot kernel.
+///
+/// Marking an axis dynamic buys one compiled kernel per contraction site
+/// instead of one per shape; the price is that its loop bound is a loaded
+/// value rather than an immediate, and every stride that is a product
+/// involving it becomes a multiply instead of a folded constant. matmul is
+/// the worst case in this file for that — a tight three-deep nest with
+/// nothing else to hide behind — so this is where to look for a regression.
+///
+/// Bit equality is asserted, not merely tolerated: a dynamic axis must
+/// change what is a constant and nothing else.
+fn section_dynamic(bad: &mut Vec<String>) {
+    println!("\n=== 5. dynamic axes: c[i,k] = sum(j: a[i,j] * b[j,k]) with runtime extents ===");
+    let reg = Registry::<f32>::builtins();
+    let prog = compile("c[i,k] = sum(j: a[i,j] * b[j,k])", &reg);
+
+    // `j` alone is the KV-cache case (the contraction length grows); all
+    // three is the pessimal case, where no extent is a constant anywhere.
+    let cases: [(&str, &[&str]); 3] =
+        [("static (baked extents)", &[]), ("dynamic j", &["j"]), ("dynamic i,j,k", &["i", "j", "k"])];
+
+    for &n in &[16usize, 64, 256] {
+        println!("\n--- {n}×{n} ---");
+        let a = filled(vec![n, n], 7);
+        let b = filled(vec![n, n], 8);
+
+        let mut base: Vec<u32> = Vec::new();
+        let mut static_us = 0.0;
+        for (label, dynamic) in cases {
+            let mut c = Dense::<f32>::zeros(vec![n, n]);
+            run_with(
+                &prog,
+                &reg,
+                &[("a", &a), ("b", &b)],
+                &mut [("c", &mut c)],
+                RunOptions { dynamic },
+            )
+            .unwrap();
+            let bits: Vec<u32> = c.data.iter().map(|v| v.to_bits()).collect();
+            if base.is_empty() {
+                base = bits;
+            } else if bits != base {
+                let msg = format!("matmul {n}²: {label} is not bit-identical to the static run");
+                println!("  !! {msg}");
+                bad.push(msg);
+            }
+
+            let us = bench(label, || {
+                let mut c = Dense::<f32>::zeros(vec![n, n]);
+                run_with(
+                    &prog,
+                    &reg,
+                    &[("a", &a), ("b", &b)],
+                    &mut [("c", &mut c)],
+                    RunOptions { dynamic },
+                )
+                .unwrap();
+                std::hint::black_box(&c);
+            });
+            if dynamic.is_empty() {
+                static_us = us;
+            } else {
+                println!("  {label} / static: {:.2}×", us / static_us);
+            }
+        }
+    }
+}
+
 fn main() {
     println!("=== linalg::lang v1 evaluator bench ===");
     println!("(mean µs/iter, iteration counts auto-calibrated to ~300 ms per arm)");
@@ -489,6 +559,7 @@ fn main() {
     section_softmax(&mut bad);
     section_mixed(&mut bad);
     section_multi_statement(&mut bad);
+    section_dynamic(&mut bad);
 
     println!("\n=== correctness summary ===");
     if bad.is_empty() {

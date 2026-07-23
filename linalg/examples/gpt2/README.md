@@ -123,6 +123,7 @@ uv run examples/gpt2/gpt2_reference.py
 cargo run --release --example gpt2
 cargo run --release --example gpt2 -- programs   # print the programs
 cargo run --release --example gpt2 -- bench      # time both backends
+cargo run --release --example gpt2 -- bench static   # …with the KV length baked in
 ```
 
 Add `--features jit` to compile the language's eligible contractions with
@@ -142,6 +143,8 @@ tokens: [21, 10, 7, 0, 20, 17, 3, 19, ...]
 runs               : 352 (1536 statements), 1536 on the kernel fast path
 reductions         : 1120 JIT / 96 tape (96 with a fused store map)
 scalar fn calls    : 96 inline / 0 indirect
+dynamic axes       : ["t"], on 288 of 1120 JIT'd reductions
+kernel cache keys  : 9 (one Cranelift compile each)
 
 ── language vs einsum VM ──
 token streams      : identical
@@ -164,9 +167,18 @@ comparison fold on `±0.0` and NaN.
 ### Benchmark
 
 `-- bench` decodes the whole context from a cold KV cache on both backends and
-reports per-token latency, plus what the *growing* KV cache costs the language:
-one compiled kernel per (contraction site, context length) pair, since the
-compiled-kernel cache is keyed by shape.
+reports per-token latency, plus what the *growing* KV cache costs the language.
+
+The KV length `t` is the one extent in the decode that changes from step to
+step. It is marked **dynamic** (`RunOptions::dynamic`), so the three
+`t`-dependent contraction sites (`s`, `zs`, `hd`) take it as a runtime argument
+and one compiled kernel serves every context length; everything else — `n_embd`,
+`n_head`, `head_dim`, `mlp_hidden`, `vocab` — stays a baked constant. That is
+**9 compiled kernels per decode instead of 102**, and a cold decode within
+~1.3× of a warm one instead of ~4.3×. Append `static` (`-- bench static`,
+`-- static`) to un-mark it and measure the difference — only the first decode in
+a process is cold, so the two configurations have to be run as two processes.
+The logits are bit-identical either way; the example asserts that on every run.
 
 ### Running without the trained weights
 

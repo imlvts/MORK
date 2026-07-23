@@ -29,10 +29,18 @@
 //!   visits only that row's stored non-zeros (over `row_ptr`/`col_idx`/
 //!   `values`), exactly like the VM's sparse loop, so structural zeros are
 //!   skipped at native speed.
-//! - **Shape-specialized.** Dimensions are baked in as constants, so a given
-//!   [`EinsumF32Jit`] is valid only for the exact shapes (and per-input
-//!   dense/sparse kinds) it was compiled for; [`run`](EinsumF32Jit::run)
-//!   asserts this.
+//! - **Shape-specialized, except where you ask otherwise.** Dimensions are
+//!   baked in as constants by default, so a given [`EinsumF32Jit`] is valid
+//!   only for the exact shapes (and per-input dense/sparse kinds) it was
+//!   compiled for; [`run`](EinsumF32Jit::run) asserts this. Naming a spec
+//!   letter in [`compile_reduce_mapped_dyn`](EinsumF32Jit::compile_reduce_mapped_dyn)'s
+//!   `dynamic` list instead makes that axis a **runtime argument**: its
+//!   loop bound, and any stride that depends on it, are read from a dims
+//!   vector on entry, so one compiled program serves every extent of that
+//!   axis. Everything else stays a constant. This is a pure
+//!   *specialization* choice — the emitted floating-point operation
+//!   sequence is identical either way, so results are bit-identical to the
+//!   fully-baked form.
 //! - **Layout seam.** [`Layout`] abstracts random-access element addressing.
 //!   `DenseLayout` is the only implementor (CSR has no constant-time random
 //!   address, so it participates through sparse iteration instead).
@@ -41,10 +49,12 @@
 //! Rust-side call is a single monomorphic `extern "C"` invocation regardless
 //! of arity or per-input layout. A dense input contributes one pointer
 //! (its `f32` data); a CSR input contributes three (`row_ptr`, `col_idx`,
-//! `values`):
+//! `values`); the third argument carries the dynamic axes' extents, one
+//! `usize` per dynamic spec letter in ascending letter order (unread, and
+//! null, when there are none):
 //!
 //! ```text
-//! extern "C" fn(ins: *const *const u8, outs: *const *mut u8)
+//! extern "C" fn(ins: *const *const u8, outs: *const *mut u8, dims: *const usize)
 //! ```
 //!
 //! # Coverage limits
@@ -288,7 +298,58 @@ impl JitInput<'_> {
 #[derive(Clone, PartialEq, Eq)]
 struct InputSpec {
     is_sparse: bool,
-    shape: Vec<usize>,
+    /// The spec slot of each axis, so a dynamic axis can be resolved
+    /// against the dims table at run time.
+    pattern: Vec<u8>,
+    /// Compiled extent per axis; `None` where the axis is **dynamic** and
+    /// so is whatever the caller passes.
+    shape: Vec<Option<usize>>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Dimensions: baked constants and runtime arguments
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An extent (or a stride derived from extents) inside generated code: a
+/// compile-time constant, or a value read from the runtime dims argument.
+///
+/// A [`Dim::Var`] is always materialized in the entry block, which
+/// dominates the whole nest, so it is usable from any later block.
+#[derive(Clone, Copy)]
+enum Dim {
+    Const(i64),
+    Var(Value),
+}
+
+impl Dim {
+    fn value(self, b: &mut FunctionBuilder, ptr_ty: Type) -> Value {
+        match self {
+            Dim::Const(c) => b.ins().iconst(ptr_ty, c),
+            Dim::Var(v) => v,
+        }
+    }
+
+    /// `self * other`, folding when both sides are known. Constant folding
+    /// here is what keeps a fully-static program's code *identical* to what
+    /// it was before dynamic axes existed: nothing is emitted at all.
+    fn mul(self, other: Dim, b: &mut FunctionBuilder, ptr_ty: Type) -> Dim {
+        match (self, other) {
+            (Dim::Const(a), Dim::Const(c)) => Dim::Const(a * c),
+            _ => {
+                let x = self.value(b, ptr_ty);
+                let y = other.value(b, ptr_ty);
+                Dim::Var(b.ins().imul(x, y))
+            }
+        }
+    }
+
+    /// `factor * self`, as an addend of an address computation.
+    fn mul_index(self, idx: Value, b: &mut FunctionBuilder) -> Value {
+        match self {
+            Dim::Const(c) => b.ins().imul_imm(idx, c),
+            Dim::Var(v) => b.ins().imul(idx, v),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -308,18 +369,20 @@ trait Layout {
     ) -> Value;
 }
 
-/// Row-major dense layout with strides baked in as constants.
+/// Row-major dense layout. A stride is baked in as a constant unless some
+/// extent it is a product of is dynamic, in which case it is computed once
+/// in the entry block.
 struct DenseLayout {
     /// Element stride per axis (in elements, not bytes).
-    strides: Vec<i64>,
+    strides: Vec<Dim>,
 }
 
 impl DenseLayout {
-    fn new(axis_dims: &[usize]) -> Self {
+    fn new(b: &mut FunctionBuilder, ptr_ty: Type, axis_dims: &[Dim]) -> Self {
         let n = axis_dims.len();
-        let mut strides = vec![1i64; n];
+        let mut strides = vec![Dim::Const(1); n];
         for j in (0..n.saturating_sub(1)).rev() {
-            strides[j] = strides[j + 1] * axis_dims[j + 1] as i64;
+            strides[j] = strides[j + 1].mul(axis_dims[j + 1], b, ptr_ty);
         }
         Self { strides }
     }
@@ -335,7 +398,7 @@ impl Layout for DenseLayout {
     ) -> Value {
         let mut off = b.ins().iconst(ptr_ty, 0);
         for (j, &idx) in indices.iter().enumerate() {
-            let contrib = b.ins().imul_imm(idx, self.strides[j]);
+            let contrib = self.strides[j].mul_index(idx, b);
             off = b.ins().iadd(off, contrib);
         }
         // f32 == 4 bytes; offset (elements) << 2 == byte offset.
@@ -359,9 +422,21 @@ pub struct EinsumF32Jit {
     /// `JITModule::free_memory(self)`. Always `Some` between construction
     /// and drop; the [`Drop`] impl is the only place it goes to `None`.
     module: Option<JITModule>,
-    func: extern "C" fn(*const *const u8, *const *mut u8),
+    func: extern "C" fn(*const *const u8, *const *mut u8, *const usize),
     inputs: Vec<InputSpec>,
-    output_shapes: Vec<Vec<usize>>,
+    /// Spec slot per axis of each output, and the compiled extent (`None`
+    /// where the axis is dynamic).
+    outputs: Vec<(Vec<u8>, Vec<Option<usize>>)>,
+    /// Spec slots compiled as runtime arguments, ascending. The generated
+    /// code reads their extents from the dims argument in this order.
+    dyn_slots: Vec<u8>,
+    /// Parallel to `dyn_slots`: `(input, axis)` to read each dynamic
+    /// extent from at run time. Every dynamic slot is required at compile
+    /// time to occur in some input pattern, so this always exists.
+    dyn_src: Vec<(usize, usize)>,
+    /// Extent per spec slot as compiled; entries for dynamic slots are
+    /// placeholders that [`run`](Self::run) overwrites.
+    static_dims: [usize; 26],
 }
 
 impl Drop for EinsumF32Jit {
@@ -445,6 +520,54 @@ impl EinsumF32Jit {
         inputs: &[JitInput],
         output_shapes: &[Vec<usize>],
     ) -> Result<Self, JitError> {
+        Self::compile_reduce_mapped_dyn(
+            spec,
+            reduce,
+            combine,
+            load_maps,
+            store_map,
+            inputs,
+            output_shapes,
+            &[],
+        )
+    }
+
+    /// [`compile_reduce_mapped`](Self::compile_reduce_mapped) with some
+    /// axes compiled as **runtime arguments** instead of baked constants.
+    ///
+    /// `dynamic` names spec letters (`'t'`, …). For each one, the generated
+    /// code reads the extent from a dims vector on entry rather than
+    /// materializing it as a constant, and any stride that is a product
+    /// involving it becomes a multiply instead of a folded constant.
+    /// Everything else — every other loop bound, every other stride — is
+    /// baked exactly as before, and a `dynamic` list that is empty
+    /// reproduces the old code instruction for instruction.
+    ///
+    /// The point is reuse: one program then serves *every* extent of that
+    /// axis, so a caller whose shapes grow (a KV cache, a batch dimension)
+    /// pays Cranelift once instead of once per shape.
+    /// [`run`](Self::run) reads the actual extents off the inputs and
+    /// checks that every occurrence agrees, exactly as it checks a static
+    /// axis against its compiled value.
+    ///
+    /// The **floating-point** instruction sequence is unaffected — same
+    /// loop nest, same order, same operations — so a dynamic axis is
+    /// bit-identical to the same axis baked static.
+    ///
+    /// Errors ([`JitError::Unsupported`]) if a letter is not a lowercase
+    /// ASCII letter, does not occur in the spec, or occurs only in an
+    /// output (there would be nothing to read its extent from).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_reduce_mapped_dyn(
+        spec: &str,
+        reduce: Reduce,
+        combine: Combine,
+        load_maps: &[&[UnaryMap]],
+        store_map: &[UnaryMap],
+        inputs: &[JitInput],
+        output_shapes: &[Vec<usize>],
+        dynamic: &[char],
+    ) -> Result<Self, JitError> {
         if !load_maps.is_empty() && load_maps.len() != inputs.len() {
             return Err(JitError::Unsupported("load_maps must be empty or one chain per input"));
         }
@@ -483,6 +606,37 @@ impl EinsumF32Jit {
             }
         }
 
+        // ── Dynamic axes: spec letters whose extent becomes an argument. ──
+        let mut dyn_mask = [false; 26];
+        for &c in dynamic {
+            if !c.is_ascii_lowercase() {
+                return Err(JitError::Unsupported("a dynamic axis must be a lowercase letter"));
+            }
+            dyn_mask[(c as u8 - b'a') as usize] = true;
+        }
+        // Where to read each dynamic extent from at run time: the first
+        // input axis carrying it. An axis that no input carries has no such
+        // source, so it cannot be dynamic.
+        let mut dyn_src_of: [Option<(usize, usize)>; 26] = [None; 26];
+        for (pi, pattern) in parsed.inputs.iter().enumerate() {
+            for (pos, &s) in pattern.iter().enumerate() {
+                let si = s as usize;
+                if dyn_mask[si] && dyn_src_of[si].is_none() {
+                    dyn_src_of[si] = Some((pi, pos));
+                }
+            }
+        }
+        for si in 0..26 {
+            if dyn_mask[si] && dyn_src_of[si].is_none() {
+                return Err(JitError::Unsupported(
+                    "a dynamic axis must occur in at least one input",
+                ));
+            }
+        }
+        let dyn_slots: Vec<u8> = (0..26u8).filter(|&s| dyn_mask[s as usize]).collect();
+        let dyn_src: Vec<(usize, usize)> =
+            dyn_slots.iter().map(|&s| dyn_src_of[s as usize].expect("checked above")).collect();
+
         // Validate output shapes against the resolved dims.
         if output_shapes.len() != parsed.outputs.len() {
             return Err(InvalidSpec::WrongInputCount {
@@ -518,28 +672,56 @@ impl EinsumF32Jit {
             &parsed.outputs,
             &is_sparse,
             &dims,
+            &dyn_slots,
             reduce,
             combine,
             load_maps,
             store_map,
         )?;
 
+        // A dynamic axis is recorded as `None` rather than as its sample
+        // extent, so `run` accepts any extent there and asserts the rest.
+        let erase = |pattern: &[u8], shape: &[usize]| -> Vec<Option<usize>> {
+            pattern
+                .iter()
+                .zip(shape)
+                .map(|(&s, &d)| if dyn_mask[s as usize] { None } else { Some(d) })
+                .collect()
+        };
+
         Ok(Self {
             module: Some(module),
             func,
-            inputs: in_shapes
-                .into_iter()
+            inputs: parsed
+                .inputs
+                .iter()
+                .zip(&in_shapes)
                 .zip(is_sparse)
-                .map(|(shape, is_sparse)| InputSpec { is_sparse, shape })
+                .map(|((pattern, shape), is_sparse)| InputSpec {
+                    is_sparse,
+                    pattern: pattern.clone(),
+                    shape: erase(pattern, shape),
+                })
                 .collect(),
-            output_shapes: output_shapes.to_vec(),
+            outputs: parsed
+                .outputs
+                .iter()
+                .zip(output_shapes)
+                .map(|(pattern, shape)| (pattern.clone(), erase(pattern, shape)))
+                .collect(),
+            dyn_slots,
+            dyn_src,
+            static_dims: dims,
         })
     }
 
     /// Execute against concrete tensors.
     ///
-    /// Panics if any input/output count, kind, or shape does not match what
-    /// this program was compiled for. Outputs must be pre-zeroed.
+    /// Panics if any input/output count, kind, rank, or **static** extent
+    /// does not match what this program was compiled for. Dynamic axes
+    /// (see [`compile_reduce_mapped_dyn`](Self::compile_reduce_mapped_dyn))
+    /// take their extent from the inputs, and every occurrence of one —
+    /// inputs and outputs alike — must agree. Outputs must be pre-zeroed.
     pub fn run(&self, inputs: &[JitInput], outputs: &mut [&mut Dense<f32>]) {
         assert_eq!(
             inputs.len(),
@@ -550,11 +732,15 @@ impl EinsumF32Jit {
         );
         assert_eq!(
             outputs.len(),
-            self.output_shapes.len(),
+            self.outputs.len(),
             "output count mismatch: got {}, compiled for {}",
             outputs.len(),
-            self.output_shapes.len()
+            self.outputs.len()
         );
+
+        // Kind and rank first, so the dynamic-extent lookups below index
+        // shapes that are known to be long enough.
+        let in_shapes: Vec<Vec<usize>> = inputs.iter().map(|i| i.shape()).collect();
         for (i, inp) in inputs.iter().enumerate() {
             let spec = &self.inputs[i];
             assert_eq!(
@@ -562,17 +748,45 @@ impl EinsumF32Jit {
                 "input {i} kind mismatch (dense vs sparse)"
             );
             assert_eq!(
-                inp.shape(), spec.shape,
-                "input {i} shape mismatch: got {:?}, compiled for {:?}",
-                inp.shape(), spec.shape
+                in_shapes[i].len(), spec.shape.len(),
+                "input {i} rank mismatch: got {}, compiled for {}",
+                in_shapes[i].len(), spec.shape.len()
             );
         }
+
+        // Resolve the dynamic axes from the inputs, then check *every*
+        // occurrence against the resolved table — which subsumes the static
+        // check, since a static slot's entry is its compiled extent.
+        let mut dims = self.static_dims;
+        let mut dyn_vals = [0usize; 26];
+        for (k, &slot) in self.dyn_slots.iter().enumerate() {
+            let (i, axis) = self.dyn_src[k];
+            dims[slot as usize] = in_shapes[i][axis];
+            dyn_vals[k] = in_shapes[i][axis];
+        }
+        for (i, spec) in self.inputs.iter().enumerate() {
+            for (pos, &s) in spec.pattern.iter().enumerate() {
+                assert_eq!(
+                    in_shapes[i][pos], dims[s as usize],
+                    "input {i} axis {pos} ('{}') is {}, expected {}",
+                    (s + b'a') as char, in_shapes[i][pos], dims[s as usize]
+                );
+            }
+        }
         for (o, out) in outputs.iter().enumerate() {
+            let (pattern, _) = &self.outputs[o];
             assert_eq!(
-                out.shape, self.output_shapes[o],
-                "output {o} shape mismatch: got {:?}, compiled for {:?}",
-                out.shape, self.output_shapes[o]
+                out.shape.len(), pattern.len(),
+                "output {o} rank mismatch: got {}, compiled for {}",
+                out.shape.len(), pattern.len()
             );
+            for (pos, &s) in pattern.iter().enumerate() {
+                assert_eq!(
+                    out.shape[pos], dims[s as usize],
+                    "output {o} axis {pos} ('{}') is {}, expected {}",
+                    (s + b'a') as char, out.shape[pos], dims[s as usize]
+                );
+            }
         }
 
         let mut in_ptrs: Vec<*const u8> = Vec::new();
@@ -583,8 +797,10 @@ impl EinsumF32Jit {
             outputs.iter_mut().map(|d| d.data.as_mut_ptr() as *mut u8).collect();
         // SAFETY: the generated code reads exactly the pointer slots that the
         // inputs above produce (kinds asserted to match what was compiled),
-        // and addresses only elements within the validated shapes.
-        (self.func)(in_ptrs.as_ptr(), out_ptrs.as_ptr());
+        // reads `dyn_slots.len()` entries of the dims vector (a 26-element
+        // stack array, and there are at most 26 slots), and addresses only
+        // elements within the validated shapes.
+        (self.func)(in_ptrs.as_ptr(), out_ptrs.as_ptr(), dyn_vals.as_ptr());
     }
 }
 
@@ -867,8 +1083,10 @@ enum InputBase {
 }
 
 /// Open a dense counted loop `for v in 0..dim`. Returns `(header, exit)`;
-/// afterwards the builder sits in the (sealed) loop body.
-fn open_dense_loop(b: &mut FunctionBuilder, ptr_ty: Type, v: Variable, dim: usize) -> (Block, Block) {
+/// afterwards the builder sits in the (sealed) loop body. A [`Dim::Const`]
+/// bound emits the same `icmp_imm` it always did; a dynamic one compares
+/// against the value read from the dims argument.
+fn open_dense_loop(b: &mut FunctionBuilder, ptr_ty: Type, v: Variable, dim: Dim) -> (Block, Block) {
     let zero = b.ins().iconst(ptr_ty, 0);
     b.def_var(v, zero);
     let header = b.create_block();
@@ -877,7 +1095,10 @@ fn open_dense_loop(b: &mut FunctionBuilder, ptr_ty: Type, v: Variable, dim: usiz
     b.ins().jump(header, &[]);
     b.switch_to_block(header);
     let idx = b.use_var(v);
-    let cond = b.ins().icmp_imm(IntCC::UnsignedLessThan, idx, dim as i64);
+    let cond = match dim {
+        Dim::Const(c) => b.ins().icmp_imm(IntCC::UnsignedLessThan, idx, c),
+        Dim::Var(d) => b.ins().icmp(IntCC::UnsignedLessThan, idx, d),
+    };
     b.ins().brif(cond, body, &[], exit, &[]);
     b.switch_to_block(body);
     b.seal_block(body);
@@ -886,11 +1107,16 @@ fn open_dense_loop(b: &mut FunctionBuilder, ptr_ty: Type, v: Variable, dim: usiz
 
 /// Row-major strides (in compound-row units) for the leading axes of a sparse
 /// input, so `compound_row = Σ leading_val[k] * strides[k]`.
-fn leading_strides(leading: &[u8], dims: &[usize; 26]) -> Vec<i64> {
+fn leading_strides(
+    b: &mut FunctionBuilder,
+    ptr_ty: Type,
+    leading: &[u8],
+    dims: &[Dim; 26],
+) -> Vec<Dim> {
     let n = leading.len();
-    let mut strides = vec![1i64; n];
+    let mut strides = vec![Dim::Const(1); n];
     for k in (0..n.saturating_sub(1)).rev() {
-        strides[k] = strides[k + 1] * dims[leading[k + 1] as usize] as i64;
+        strides[k] = strides[k + 1].mul(dims[leading[k + 1] as usize], b, ptr_ty);
     }
     strides
 }
@@ -902,13 +1128,13 @@ fn emit_compound_row(
     b: &mut FunctionBuilder,
     ptr_ty: Type,
     leading: &[u8],
-    leading_strides: &[i64],
+    leading_strides: &[Dim],
     vars: &[Variable; 26],
 ) -> Value {
     let mut compound = b.ins().iconst(ptr_ty, 0);
     for (k, &s) in leading.iter().enumerate() {
         let lv = b.use_var(vars[s as usize]);
-        let contrib = b.ins().imul_imm(lv, leading_strides[k]);
+        let contrib = leading_strides[k].mul_index(lv, b);
         compound = b.ins().iadd(compound, contrib);
     }
     compound
@@ -1022,17 +1248,22 @@ fn new_module() -> JITModule {
 }
 
 /// Generate native code for `inputs -> outputs` with the given per-slot dims.
+///
+/// `dyn_slots` (ascending) are the slots whose extent is read from the
+/// third argument at entry instead of baked from `dims`; their entries in
+/// `dims` are never consulted.
 #[allow(clippy::too_many_arguments)]
 fn codegen(
     inputs: &[Vec<u8>],
     outputs: &[Vec<u8>],
     is_sparse: &[bool],
     dims: &[usize; 26],
+    dyn_slots: &[u8],
     reduce: Reduce,
     combine: Combine,
     load_maps: &[&[UnaryMap]],
     store_map: &[UnaryMap],
-) -> Result<(JITModule, extern "C" fn(*const *const u8, *const *mut u8)), JitError> {
+) -> Result<(JITModule, extern "C" fn(*const *const u8, *const *mut u8, *const usize)), JitError> {
     let any_sparse = is_sparse.iter().any(|&c| c);
 
     // A load map on a sparse input would be applied only to the *stored*
@@ -1119,11 +1350,6 @@ fn codegen(
         }
     }
 
-    // Row-major dense layouts for outputs (outputs are always dense).
-    let axis_dims = |pat: &[u8]| -> Vec<usize> { pat.iter().map(|&s| dims[s as usize]).collect() };
-    let out_layouts: Vec<DenseLayout> =
-        outputs.iter().map(|p| DenseLayout::new(&axis_dims(p))).collect();
-
     let mut module = new_module();
     let ptr_ty = module.target_config().pointer_type();
     let ptr_bytes = ptr_ty.bytes() as i32;
@@ -1132,6 +1358,7 @@ fn codegen(
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // ins:  *const *const u8
     sig.params.push(AbiParam::new(ptr_ty)); // outs: *const *mut  u8
+    sig.params.push(AbiParam::new(ptr_ty)); // dims: *const usize
     ctx.func.signature = sig;
 
     let mut fbctx = FunctionBuilderContext::new();
@@ -1153,6 +1380,18 @@ fn codegen(
         b.seal_block(entry);
         let ins_ptr = b.block_params(entry)[0];
         let outs_ptr = b.block_params(entry)[1];
+        let dims_ptr = b.block_params(entry)[2];
+
+        // Per-slot extents: a constant for a static axis, a value read once
+        // from the dims argument for a dynamic one. Read in the entry
+        // block, which dominates the whole nest.
+        let mut slot_dim: [Dim; 26] = std::array::from_fn(|s| Dim::Const(dims[s] as i64));
+        for (k, &s) in dyn_slots.iter().enumerate() {
+            let v = b.ins().load(ptr_ty, MemFlags::trusted(), dims_ptr, k as i32 * ptr_bytes);
+            slot_dim[s as usize] = Dim::Var(v);
+        }
+        let axis_dims =
+            |pat: &[u8]| -> Vec<Dim> { pat.iter().map(|&s| slot_dim[s as usize]).collect() };
 
         // Load base pointer(s) per input. Each input's layout decides how
         // many pointer-slots it consumes; we just walk them in order.
@@ -1177,7 +1416,8 @@ fn codegen(
             } else {
                 let base =
                     b.ins().load(ptr_ty, MemFlags::trusted(), ins_ptr, slot * ptr_bytes);
-                let layout = DenseLayout::new(&axis_dims(&inputs[i]));
+                let ad = axis_dims(&inputs[i]);
+                let layout = DenseLayout::new(&mut b, ptr_ty, &ad);
                 bases.push(InputBase::Dense { layout, base });
                 slot += 1;
             }
@@ -1185,19 +1425,33 @@ fn codegen(
         let out_bases: Vec<Value> = (0..outputs.len())
             .map(|i| b.ins().load(ptr_ty, MemFlags::trusted(), outs_ptr, i as i32 * ptr_bytes))
             .collect();
+        // Row-major dense layouts for outputs (outputs are always dense).
+        let out_layouts: Vec<DenseLayout> = outputs
+            .iter()
+            .map(|p| {
+                let ad = axis_dims(p);
+                DenseLayout::new(&mut b, ptr_ty, &ad)
+            })
+            .collect();
 
         if register_acc {
             // ── All-dense single output: register accumulator. ──
             // for free: { acc = identity; for contracted { acc = acc ⊕ contrib }; out = acc }
             let mut free_loops = Vec::new();
             for &s in &free {
-                free_loops.push((vars[s as usize], open_dense_loop(&mut b, ptr_ty, vars[s as usize], dims[s as usize])));
+                free_loops.push((
+                    vars[s as usize],
+                    open_dense_loop(&mut b, ptr_ty, vars[s as usize], slot_dim[s as usize]),
+                ));
             }
             let ident = b.ins().f32const(reduce.identity::<f32>());
             b.def_var(acc, ident);
             let mut c_loops = Vec::new();
             for &s in &contracted {
-                c_loops.push((vars[s as usize], open_dense_loop(&mut b, ptr_ty, vars[s as usize], dims[s as usize])));
+                c_loops.push((
+                    vars[s as usize],
+                    open_dense_loop(&mut b, ptr_ty, vars[s as usize], slot_dim[s as usize]),
+                ));
             }
 
             let contrib = emit_contribution(
@@ -1229,12 +1483,12 @@ fn codegen(
                             &mut b,
                             ptr_ty,
                             vars[*slot as usize],
-                            dims[*slot as usize],
+                            slot_dim[*slot as usize],
                         );
                         opened.push((vars[*slot as usize], h, e));
                     }
                     LoopOp::Sparse { input_idx, leading, col_slot } => {
-                        let strides = leading_strides(leading, dims);
+                        let strides = leading_strides(&mut b, ptr_ty, leading, &slot_dim);
                         let compound =
                             emit_compound_row(&mut b, ptr_ty, leading, &strides, &vars);
                         let (layout, input_bases) = match &bases[*input_idx] {
@@ -1292,7 +1546,10 @@ fn codegen(
     // signature (two pointer params, no return); `module` is returned and
     // kept alive by the caller so the code stays mapped.
     let func = unsafe {
-        mem::transmute::<*const u8, extern "C" fn(*const *const u8, *const *mut u8)>(code)
+        mem::transmute::<
+            *const u8,
+            extern "C" fn(*const *const u8, *const *mut u8, *const usize),
+        >(code)
     };
     Ok((module, func))
 }
@@ -1324,6 +1581,128 @@ mod tests {
         let mut c = Dense::<f32>::zeros(vec![2, 2]);
         jit.run(&[d(&a), d(&b)], &mut [&mut c]);
         assert_eq!(c.data, vec![58., 64., 139., 154.]);
+    }
+
+    /// A small deterministic LCG so the dynamic-vs-static comparison below
+    /// sees awkward values (`±0.0`, `±∞`, denormals) rather than pretty ones.
+    fn awkward(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                match (s >> 60) & 7 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f32::INFINITY,
+                    3 => f32::NEG_INFINITY,
+                    4 => 1.0e-38,
+                    _ => ((s >> 20) as i32 as f32) / 7.0e5,
+                }
+            })
+            .collect()
+    }
+
+    fn dyn_compile<'a>(
+        spec: &str,
+        inputs: &[JitInput<'a>],
+        out: &[Vec<usize>],
+        dynamic: &[char],
+    ) -> Result<EinsumF32Jit, JitError> {
+        EinsumF32Jit::compile_reduce_mapped_dyn(
+            spec,
+            Reduce::Sum,
+            Combine::Mul,
+            &[],
+            &[],
+            inputs,
+            out,
+            dynamic,
+        )
+    }
+
+    /// One program, compiled once, run at several extents of the dynamic
+    /// axis — each result **bit-identical** to a program specialized to that
+    /// extent. This is the whole promise of a dynamic axis: it changes what
+    /// is a constant, never what arithmetic happens.
+    #[test]
+    fn dynamic_axis_is_bit_identical_to_static() {
+        // `b` (the contracted axis) and `c` (a free axis, so it also drives
+        // the output's stride) are both runtime arguments.
+        let seeds = [3u64, 9, 17];
+        let dynamic = ['b', 'c'];
+        let mut shared: Option<EinsumF32Jit> = None;
+        for (nb, nc) in [(1usize, 1usize), (5, 3), (7, 4), (16, 9)] {
+            let a = dense(vec![2, nb], &awkward(2 * nb, seeds[0]));
+            let bb = dense(vec![nb, nc], &awkward(nb * nc, seeds[1]));
+            let ins = [d(&a), d(&bb)];
+            let oshape = vec![vec![2, nc]];
+
+            let jit = shared.get_or_insert_with(|| {
+                dyn_compile("ab,bc->ac", &ins, &oshape, &dynamic).unwrap()
+            });
+            let mut got = Dense::<f32>::zeros(vec![2, nc]);
+            jit.run(&ins, &mut [&mut got]);
+
+            let stat = EinsumF32Jit::compile("ab,bc->ac", &ins, &oshape).unwrap();
+            let mut want = Dense::<f32>::zeros(vec![2, nc]);
+            stat.run(&ins, &mut [&mut want]);
+
+            let g: Vec<u32> = got.data.iter().map(|v| v.to_bits()).collect();
+            let w: Vec<u32> = want.data.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(g, w, "dynamic vs static bits at ({nb}, {nc}) — seed {}", seeds[2]);
+        }
+    }
+
+    /// Dynamic axes also work under the general (read-modify-write) nest
+    /// and with a batch axis whose extent drives every leading stride.
+    #[test]
+    fn dynamic_batch_axis_matches_static() {
+        for nb in [1usize, 2, 5] {
+            let a = dense(vec![nb, 3, 4], &awkward(nb * 12, 11));
+            let bb = dense(vec![nb, 4, 2], &awkward(nb * 8, 23));
+            let ins = [d(&a), d(&bb)];
+            let oshape = vec![vec![nb, 3, 2]];
+            let jit = dyn_compile("aij,ajk->aik", &ins, &oshape, &['a']).unwrap();
+            let mut got = Dense::<f32>::zeros(vec![nb, 3, 2]);
+            jit.run(&ins, &mut [&mut got]);
+            let stat = EinsumF32Jit::compile("aij,ajk->aik", &ins, &oshape).unwrap();
+            let mut want = Dense::<f32>::zeros(vec![nb, 3, 2]);
+            stat.run(&ins, &mut [&mut want]);
+            assert_eq!(
+                got.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_axis_rejected_when_unreadable() {
+        let a = dense(vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = dense(vec![3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let ins = [d(&a), d(&b)];
+        // Not a lowercase letter.
+        assert!(matches!(
+            dyn_compile("ab,bc->ac", &ins, &[vec![2, 2]], &['Z']),
+            Err(JitError::Unsupported("a dynamic axis must be a lowercase letter"))
+        ));
+        // A letter no input carries has nothing to read its extent from.
+        assert!(matches!(
+            dyn_compile("ab,bc->ac", &ins, &[vec![2, 2]], &['z']),
+            Err(JitError::Unsupported("a dynamic axis must occur in at least one input"))
+        ));
+    }
+
+    /// A run whose inputs disagree about a dynamic axis is a caller bug,
+    /// caught with the same assertion a static mismatch gets.
+    #[test]
+    #[should_panic(expected = "axis 0 ('b')")]
+    fn dynamic_axis_inconsistent_between_inputs_panics() {
+        let a = dense(vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = dense(vec![3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let jit = dyn_compile("ab,bc->ac", &[d(&a), d(&b)], &[vec![2, 2]], &['b']).unwrap();
+        let wrong = dense(vec![4, 2], &[0.; 8]);
+        let mut c = Dense::<f32>::zeros(vec![2, 2]);
+        jit.run(&[d(&a), d(&wrong)], &mut [&mut c]);
     }
 
     #[test]

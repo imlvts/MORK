@@ -56,7 +56,9 @@ mod sexpr;
 
 pub use ast::{BinOp, Expr, Program, Stmt};
 pub use check::{Checked, check};
-pub use eval::{RunReport, run, run_reference, run_reported};
+pub use eval::{RunOptions, RunReport, run, run_reference, run_reported, run_with};
+#[cfg(feature = "jit")]
+pub use fast::jit_cache_len;
 pub use parse::parse;
 pub use sexpr::parse_sexpr;
 

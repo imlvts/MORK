@@ -28,7 +28,8 @@ use std::collections::HashMap;
 
 use linalg::dense::Dense;
 use linalg::lang::{
-    BinOp, Expr, LangError, Program, Registry, Stmt, check, parse, run_reference, run_reported,
+    BinOp, Expr, LangError, Program, Registry, RunOptions, Stmt, check, parse, run_reference,
+    run_reported, run_with,
 };
 use linalg::tensor::NDIndex;
 
@@ -392,6 +393,17 @@ struct Stats {
     /// Elements whose raw bits differed *and* were NaN on both sides —
     /// the exact size of the carve-out `bits_eq` documents.
     nan_payload_diffs: usize,
+    /// Step 6. Every program is additionally run a third time with a
+    /// random subset of its index axes marked **dynamic** (their extents
+    /// compiled as runtime arguments rather than constants) and compared,
+    /// bit for bit, against the same program with those axes static.
+    /// `dyn_axes` counts the axes actually marked; `dyn_reductions` the
+    /// JIT'd reductions that had at least one.
+    dyn_axes: usize,
+    dyn_reductions: usize,
+    /// Elements where the dynamic run differed from the static one only in
+    /// a NaN payload. Anything else is a hard failure, not a statistic.
+    dyn_nan_payload_diffs: usize,
 }
 
 /// Run one generated program down both paths and demand bit equality.
@@ -402,6 +414,15 @@ fn differential(g: &mut Gen, stats: &mut Stats) {
         stats.skipped += 1;
         return;
     };
+
+    // Which axes to mark dynamic on the third pass. Chosen here, while `g`
+    // is still free to mutate: each index name of the program independently,
+    // so the sweep sees all-static, all-dynamic and every mixture —
+    // including axes only a stride depends on and axes that are only a loop
+    // bound.
+    let mut names: Vec<String> = g.extent.keys().cloned().collect();
+    names.sort();
+    let marked: Vec<String> = names.into_iter().filter(|_| g.rng.chance(1, 2)).collect();
 
     let inputs: Vec<(&str, &dyn NDIndex<f32>)> =
         g.inputs.iter().map(|(n, _, d)| (n.as_str(), d as &dyn NDIndex<f32>)).collect();
@@ -440,6 +461,9 @@ fn differential(g: &mut Gen, stats: &mut Stats) {
                     describe(&prog),
                 );
             }
+            dynamic_matches_static(
+                &marked, &checked, &reg, &inputs, &out_name, &fast_out, &prog, stats,
+            );
             stats.checked += 1;
             stats.jit_reductions += report.jit_reductions;
             stats.tape_reductions += report.tape_reductions;
@@ -459,6 +483,68 @@ fn differential(g: &mut Gen, stats: &mut Stats) {
         }
         (a, b) => panic!("paths disagree on success: kernel {a:?} vs reference {b:?}"),
     }
+}
+
+/// Re-run the same program on the same data with a random subset of its
+/// index axes marked **dynamic**, and demand the *same bits*.
+///
+/// This is the specific risk step 6 introduces. Handing an extent to
+/// generated code as an argument instead of a constant must not change
+/// vectorization, tail handling, or accumulation order — if it did, the
+/// two runs would differ, and only here would that show up: the
+/// tree-walker never sees the distinction, so the oracle comparison above
+/// cannot catch it.
+#[allow(clippy::too_many_arguments)]
+fn dynamic_matches_static(
+    marked: &[String],
+    checked: &linalg::lang::Checked,
+    reg: &Registry<f32>,
+    inputs: &[(&str, &dyn NDIndex<f32>)],
+    out_name: &str,
+    static_out: &Dense<f32>,
+    prog: &Program,
+    stats: &mut Stats,
+) {
+    let dynamic: Vec<&str> = marked.iter().map(|s| s.as_str()).collect();
+
+    let mut dyn_out = Dense::<f32>::zeros(static_out.shape.clone());
+    let report = run_with(
+        checked,
+        reg,
+        inputs,
+        &mut [(out_name, &mut dyn_out as &mut dyn NDIndex<f32>)],
+        RunOptions { dynamic: &dynamic },
+    )
+    .expect("bind succeeded on the static run, so it must here too");
+    assert_eq!(
+        report.dynamic_axes,
+        checked_axis_count(checked, &dynamic),
+        "RunReport disagrees about how many axes were marked"
+    );
+
+    if let Some((i, x, y)) = bits_eq(&dyn_out.data, &static_out.data) {
+        panic!(
+            "dynamic axes {dynamic:?} changed the result at flat index {i}: \
+             dynamic {x:?} ({:#010x}) vs static {y:?} ({:#010x})\nprogram:\n{}",
+            x.to_bits(),
+            y.to_bits(),
+            describe(prog),
+        );
+    }
+    stats.dyn_axes += report.dynamic_axes;
+    stats.dyn_reductions += report.jit_dynamic_reductions;
+    stats.dyn_nan_payload_diffs += dyn_out
+        .data
+        .iter()
+        .zip(&static_out.data)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+}
+
+/// How many index *ids* the marked names cover — binders are per-
+/// occurrence, so one name can be several axes.
+fn checked_axis_count(checked: &linalg::lang::Checked, dynamic: &[&str]) -> usize {
+    checked.index_names().iter().filter(|n| dynamic.contains(&n.as_str())).count()
 }
 
 /// Best-effort rendering of a generated program for failure messages.
@@ -517,6 +603,8 @@ fn report(tag: &str, s: &Stats) {
          maps: {} store maps fused into the reduction ({} of them emitted by the JIT), \
          {} load maps fused into a JIT'd contraction; \
          block ops: {} inline built-ins, {} indirect calls; \
+         dynamic axes: {} marked over {} JIT'd reductions, {} elements differed \
+         from the static run in NaN payload alone; \
          {} output elements compared ({} NaN, of which {} differed only in \
          NaN payload)",
         s.checked,
@@ -528,6 +616,9 @@ fn report(tag: &str, s: &Stats) {
         s.jit_load_maps,
         s.inline_fn_ops,
         s.indirect_fn_ops,
+        s.dyn_axes,
+        s.dyn_reductions,
+        s.dyn_nan_payload_diffs,
         s.elems,
         s.nan_elems,
         s.nan_payload_diffs
@@ -546,11 +637,13 @@ fn sweep_random_programs() {
     assert!(s.tape_reductions > 0, "no reduction exercised the tape kernel");
     assert!(s.store_maps > 0, "no store map was fused into a reduction");
     assert!(s.inline_fn_ops > 0, "no built-in was compiled to an inline block op");
+    assert!(s.dyn_axes > 0, "no axis was ever marked dynamic");
     #[cfg(feature = "jit")]
     {
         assert!(s.jit_reductions > 0, "no reduction reached the JIT");
         assert!(s.jit_load_maps > 0, "no load map was fused into a JIT'd contraction");
         assert!(s.jit_store_maps > 0, "no store map was emitted by the JIT");
+        assert!(s.dyn_reductions > 0, "no JIT'd reduction had a dynamic axis");
     }
 }
 
@@ -954,4 +1047,83 @@ fn error_surface_is_path_independent() {
     let refr = run_reference(&checked, &reg, &ins, &mut [("y", &mut out)]).unwrap_err();
     assert_eq!(fast, refr);
     assert!(matches!(fast, LangError::ExtentMismatch { .. }));
+}
+
+// ─── dynamic axes (step 6) ──────────────────────────────────────────────
+
+/// The number step 6 exists to move: a `t`-dependent contraction run at
+/// many `t` costs one compiled kernel (one cache key) *per* `t` while `t`
+/// is baked in, and exactly one in total once `t` is a runtime argument —
+/// with the same bits out either way.
+#[cfg(feature = "jit")]
+#[test]
+fn dynamic_axis_collapses_the_kernel_cache() {
+    let reg = Registry::<f32>::builtins();
+    // Shaped like the GPT-2 attention readout: a contraction over the KV
+    // length `t`, which grows every step.
+    let checked = check(&parse("s[h] = sum(t: q[t,h] * k[t,h])").unwrap(), &reg).unwrap();
+    let lengths = [1usize, 2, 3, 5, 8, 13];
+
+    let mut go = |dynamic: &[&str]| -> (usize, Vec<Vec<u32>>) {
+        let before = linalg::lang::jit_cache_len();
+        let mut outs = Vec::new();
+        for &t in &lengths {
+            let mut q = Dense::<f32>::zeros(vec![t, 4]);
+            let mut k = Dense::<f32>::zeros(vec![t, 4]);
+            fill(&mut q, t as u64 + 1);
+            fill(&mut k, t as u64 + 101);
+            let mut s = Dense::<f32>::zeros(vec![4]);
+            let r = run_with(
+                &checked,
+                &reg,
+                &[("q", &q as &dyn NDIndex<f32>), ("k", &k)],
+                &mut [("s", &mut s as &mut dyn NDIndex<f32>)],
+                RunOptions { dynamic },
+            )
+            .unwrap();
+            assert_eq!(r.jit_reductions, 1, "the contraction must reach the JIT");
+            assert_eq!(r.jit_dynamic_reductions, usize::from(!dynamic.is_empty()));
+            outs.push(s.data.iter().map(|v| v.to_bits()).collect::<Vec<u32>>());
+        }
+        (linalg::lang::jit_cache_len() - before, outs)
+    };
+
+    let (static_keys, static_out) = go(&[]);
+    let (dyn_keys, dyn_out) = go(&["t"]);
+    assert_eq!(static_keys, lengths.len(), "a baked extent is one kernel per extent");
+    assert_eq!(dyn_keys, 1, "a dynamic extent is one kernel for all of them");
+    assert_eq!(static_out, dyn_out, "dynamic and static must be bit-identical");
+
+    // Marking the *free* axis instead keeps one kernel per `t` — the point
+    // is per-axis control, not an all-or-nothing switch.
+    let (h_keys, h_out) = go(&["h"]);
+    assert_eq!(h_keys, lengths.len());
+    assert_eq!(h_out, static_out);
+}
+
+/// A name that matches no index is ignored — the run is still correct,
+/// and `RunReport::dynamic_axes` is how a caller notices the typo.
+#[test]
+fn unknown_dynamic_name_is_ignored() {
+    let reg = Registry::<f32>::builtins();
+    let checked = check(&parse("s[h] = sum(t: q[t,h] * k[t,h])").unwrap(), &reg).unwrap();
+    let mut q = Dense::<f32>::zeros(vec![3, 4]);
+    let mut k = Dense::<f32>::zeros(vec![3, 4]);
+    fill(&mut q, 5);
+    fill(&mut k, 6);
+
+    let mut want = Dense::<f32>::zeros(vec![4]);
+    let mut got = Dense::<f32>::zeros(vec![4]);
+    let ins: Vec<(&str, &dyn NDIndex<f32>)> = vec![("q", &q), ("k", &k)];
+    run_reference(&checked, &reg, &ins, &mut [("s", &mut want as &mut dyn NDIndex<f32>)]).unwrap();
+    let r = run_with(
+        &checked,
+        &reg,
+        &ins,
+        &mut [("s", &mut got as &mut dyn NDIndex<f32>)],
+        RunOptions { dynamic: &["nosuchindex", "t"] },
+    )
+    .unwrap();
+    assert_eq!(r.dynamic_axes, 1, "only 't' names an index of this program");
+    assert!(bits_eq(&got.data, &want.data).is_none());
 }

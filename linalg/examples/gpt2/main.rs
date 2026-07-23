@@ -28,7 +28,13 @@
 //! uv run examples/gpt2/gpt2_reference.py   # NumPy reference + ref_logits.bin
 //! cargo run --release --example gpt2       # this: same decode, compared
 //! cargo run --release --example gpt2 -- bench   # time both backends
+//! cargo run --release --example gpt2 -- bench static  # …KV length baked in
 //! ```
+//!
+//! The KV-cache length is marked **dynamic** (see [`Programs::dynamic`]), so
+//! the contractions that depend on it are compiled once rather than once per
+//! context length; `static` un-marks it, which is how the difference is
+//! measured (only the first decode in a process is cold).
 //!
 //! With no `weights/` directory present it falls back to deterministic random
 //! weights (a self-contained smoke test) and skips the comparison.
@@ -38,7 +44,9 @@ use std::time::{Duration, Instant};
 
 use linalg::dense::Dense;
 use linalg::einsum::einsum_homogenous;
-use linalg::lang::{Checked, Registry, RunReport, check, parse, run, run_reported};
+use linalg::lang::{
+    Checked, Registry, RunOptions, RunReport, check, parse, run, run_with,
+};
 use linalg::tensor::NDIndex;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -194,6 +202,20 @@ struct Programs {
     head: Checked,
     /// Source of each program, in the order they run (for `-- programs`).
     sources: Vec<(&'static str, String)>,
+    /// Index axes marked **dynamic** on every `run` (RESUME step 6).
+    ///
+    /// `t` is the KV-cache length. It is the only extent in the whole
+    /// decode that changes from step to step, and with it baked in as a
+    /// constant the three `t`-dependent contraction sites (`s`, `zs`,
+    /// `hd`) each need a fresh Cranelift compile per context length.
+    /// Marking it dynamic makes those three kernels serve every length.
+    /// Everything else stays static, so `n_embd`, `n_head`, `head_dim`,
+    /// `mlp_hidden` and `vocab` are still folded into the generated code.
+    ///
+    /// Empty under `-- bench static`, which is how the before/after is
+    /// measured (only the *first* decode in a process is cold, so the two
+    /// configurations cannot be compared within one run).
+    dynamic: Vec<&'static str>,
 }
 
 impl Programs {
@@ -254,7 +276,12 @@ impl Programs {
             head: compile(&sources[4].1),
             reg,
             sources,
+            dynamic: vec!["t"],
         }
+    }
+
+    fn opts(&self) -> RunOptions<'_> {
+        RunOptions { dynamic: &self.dynamic }
     }
 }
 
@@ -272,6 +299,9 @@ struct RunStats {
     kernel_statements: usize,
     jit_reductions: usize,
     tape_reductions: usize,
+    /// JIT'd reductions with at least one dynamic axis: one compiled kernel
+    /// serving every extent of it, instead of one kernel per extent.
+    jit_dynamic_reductions: usize,
     store_maps: usize,
     inline_fn_ops: usize,
     indirect_fn_ops: usize,
@@ -285,9 +315,23 @@ impl RunStats {
         self.kernel_statements += r.kernel_statements;
         self.jit_reductions += r.jit_reductions;
         self.tape_reductions += r.tape_reductions;
+        self.jit_dynamic_reductions += r.jit_dynamic_reductions;
         self.store_maps += r.store_maps;
         self.inline_fn_ops += r.inline_fn_ops;
         self.indirect_fn_ops += r.indirect_fn_ops;
+    }
+}
+
+/// Distinct compiled-kernel cache keys this thread holds — one Cranelift
+/// compile each. Without the `jit` feature there is no such cache.
+fn kernel_cache_keys() -> Option<usize> {
+    #[cfg(feature = "jit")]
+    {
+        Some(linalg::lang::jit_cache_len())
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        None
     }
 }
 
@@ -495,11 +539,12 @@ fn calculate_step_lang(
 
     let mut x = Dense::<f32>::zeros(vec![cfg.n_embd]);
     stats.add(
-        run_reported(
+        run_with(
             &p.embed,
             &p.reg,
             &[("tok", &tok_emb as &dyn NDIndex<f32>), ("pos", &pos_emb)],
             &mut [("x", &mut x as &mut dyn NDIndex<f32>)],
+            p.opts(),
         )
         .unwrap(),
     );
@@ -512,7 +557,7 @@ fn calculate_step_lang(
         let mut k = Dense::<f32>::zeros(vec![cfg.n_head, cfg.head_dim]);
         let mut v = Dense::<f32>::zeros(vec![cfg.n_head, cfg.head_dim]);
         stats.add(
-            run_reported(
+            run_with(
                 &p.qkv,
                 &p.reg,
                 &[
@@ -526,6 +571,7 @@ fn calculate_step_lang(
                     ("k", &mut k),
                     ("v", &mut v),
                 ],
+                p.opts(),
             )
             .unwrap(),
         );
@@ -535,7 +581,7 @@ fn calculate_step_lang(
 
         let mut y = Dense::<f32>::zeros(vec![cfg.n_embd]);
         stats.add(
-            run_reported(
+            run_with(
                 &p.attn,
                 &p.reg,
                 &[
@@ -546,6 +592,7 @@ fn calculate_step_lang(
                     ("x", &x),
                 ],
                 &mut [("y", &mut y as &mut dyn NDIndex<f32>)],
+                p.opts(),
             )
             .unwrap(),
         );
@@ -554,11 +601,12 @@ fn calculate_step_lang(
         // ── MLP ──
         let mut y = Dense::<f32>::zeros(vec![cfg.n_embd]);
         stats.add(
-            run_reported(
+            run_with(
                 &p.mlp,
                 &p.reg,
                 &[("x", &x as &dyn NDIndex<f32>), ("fc1", &layer.fc1), ("fc2", &layer.fc2)],
                 &mut [("y", &mut y as &mut dyn NDIndex<f32>)],
+                p.opts(),
             )
             .unwrap(),
         );
@@ -568,11 +616,12 @@ fn calculate_step_lang(
     // No final norm (the reference just copies the last block output).
     let mut logits = Dense::<f32>::zeros(vec![cfg.vocab]);
     stats.add(
-        run_reported(
+        run_with(
             &p.head,
             &p.reg,
             &[("lm", &m.lm_head as &dyn NDIndex<f32>), ("x", &x)],
             &mut [("logits", &mut logits as &mut dyn NDIndex<f32>)],
+            p.opts(),
         )
         .unwrap(),
     );
@@ -747,10 +796,15 @@ fn bench(model: &Model, progs: &Programs, prompt: &[usize]) {
     // The very first language decode in this process: every JIT kernel is
     // compiled here, one per (contraction site, KV length) pair, because the
     // cache key includes the shapes. Must be measured before any warmup.
+    let keys_before = kernel_cache_keys();
     let mut cold_stats = RunStats::default();
     let t0 = Instant::now();
     let (tokens, _) = run_decode(model, progs, Backend::Lang, prompt, &mut cold_stats);
     let cold = t0.elapsed().as_secs_f64();
+    let decode_keys = match (kernel_cache_keys(), keys_before) {
+        (Some(a), Some(b)) => Some(a - b),
+        _ => None,
+    };
     let steps = tokens.len(); // forwards per decode (prompt + generated)
 
     // Best of five batches, each calibrated to about a second of work, so the
@@ -809,10 +863,26 @@ fn bench(model: &Model, progs: &Programs, prompt: &[usize]) {
     println!("── what the growing KV cache costs (RESUME step 6) ──");
     let lang_per_token_us = lang / steps as f64 * 1e6;
     println!(
+        "dynamic axes       : {} — {} of {} JIT'd reductions per decode compiled with a\n\
+         \x20                    runtime extent instead of a baked one",
+        if progs.dynamic.is_empty() {
+            "none (`-- bench static`)".to_string()
+        } else {
+            format!("{:?}", progs.dynamic)
+        },
+        cold_stats.jit_dynamic_reductions,
+        cold_stats.jit_reductions,
+    );
+    match decode_keys {
+        Some(k) => println!(
+            "kernel cache keys  : {k} distinct (spec, layouts, static dims, ops) keys built by one\n\
+             \x20                    decode — one Cranelift compile each"
+        ),
+        None => println!("kernel cache keys  : n/a (no `jit` feature — nothing is compiled)"),
+    }
+    println!(
         "cold decode        : {:.3} ms, {:.3} ms above warm ({:.1}×) — one-off kernel build,\n\
-         \x20                    once per (contraction site, KV length) pair because the compiled\n\
-         \x20                    kernel is cached by shape (dominated by Cranelift under \
-         `--features jit`)",
+         \x20                    one per cache key (dominated by Cranelift under `--features jit`)",
         cold * 1e3,
         (cold - lang) * 1e3,
         cold / lang
@@ -891,7 +961,15 @@ fn main() {
     };
 
     let cfg = model.cfg;
-    let progs = Programs::new(cfg);
+    let mut progs = Programs::new(cfg);
+    // `-- static` un-marks the KV length, so the generated kernels bake it
+    // in as they did before RESUME step 6. Only the *first* decode in a
+    // process is cold, so this is how the before/after is measured: run the
+    // example twice.
+    if std::env::args().any(|a| a == "static") {
+        progs.dynamic.clear();
+    }
+    let progs = progs;
 
     // `cargo run --release --example gpt2 -- programs` prints the source of
     // every language program the decode runs.
@@ -909,8 +987,13 @@ fn main() {
     }
 
     let mut stats = RunStats::default();
+    let keys_before = kernel_cache_keys();
     let (tokens, lang_logits) =
         run_decode(&model, &progs, Backend::Lang, &prompt_tokens, &mut stats);
+    let decode_keys = match (kernel_cache_keys(), keys_before) {
+        (Some(a), Some(b)) => Some(a - b),
+        _ => None,
+    };
     let (vm_tokens, vm_logits) =
         run_decode(&model, &progs, Backend::Einsum, &prompt_tokens, &mut RunStats::default());
 
@@ -935,6 +1018,14 @@ fn main() {
         "scalar fn calls    : {} inline / {} indirect",
         stats.inline_fn_ops, stats.indirect_fn_ops
     );
+    println!(
+        "dynamic axes       : {:?}, on {} of {} JIT'd reductions",
+        progs.dynamic, stats.jit_dynamic_reductions, stats.jit_reductions
+    );
+    match decode_keys {
+        Some(k) => println!("kernel cache keys  : {k} (one Cranelift compile each)"),
+        None => println!("kernel cache keys  : n/a (no `jit` feature)"),
+    }
 
     // ── The two backends against each other ──
     let lang_rows: Vec<&[f32]> = lang_logits.iter().map(|r| r.as_slice()).collect();

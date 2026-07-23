@@ -356,12 +356,63 @@ pub fn run_reported<T: Elem>(
     inputs: &[(&str, &dyn NDIndex<T>)],
     outputs: &mut [(&str, &mut dyn NDIndex<T>)],
 ) -> Result<RunReport, LangError> {
+    run_with(checked, reg, inputs, outputs, RunOptions::default())
+}
+
+/// Per-run execution options. Purely a **specialization** choice: nothing
+/// here changes what a program computes, only how the backend is asked to
+/// compile it. `RunOptions::default()` is what [`run`] uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions<'a> {
+    /// Index names whose extent should be a **runtime argument** to
+    /// generated code rather than a baked-in constant.
+    ///
+    /// These are *index* names — the `t` in `sum(t: …)` or in `s[h,t]`,
+    /// not a tensor name — and marking one marks every occurrence of that
+    /// name in the program. The plan and the AST stay shape-polymorphic
+    /// either way; what changes is that a JIT'd contraction touching a
+    /// dynamic axis compiles **one** kernel serving every extent of it,
+    /// instead of one kernel per extent. Mark the axes that *move* between
+    /// runs (a KV-cache length, a batch size); leaving an axis static keeps
+    /// its extent a constant, which is what lets Cranelift fold strides.
+    ///
+    /// Results are bit-identical either way: a dynamic axis changes what is
+    /// a constant, never the loop nest, the iteration order, or a single
+    /// floating-point operation.
+    ///
+    /// Names that no index of the program matches are ignored;
+    /// [`RunReport::dynamic_axes`] reports how many did match, which is how
+    /// to detect a typo.
+    pub dynamic: &'a [&'a str],
+}
+
+/// [`run_reported`] with explicit [`RunOptions`].
+pub fn run_with<T: Elem>(
+    checked: &Checked,
+    reg: &Registry<T>,
+    inputs: &[(&str, &dyn NDIndex<T>)],
+    outputs: &mut [(&str, &mut dyn NDIndex<T>)],
+    opts: RunOptions<'_>,
+) -> Result<RunReport, LangError> {
     let extents = bind(checked, inputs, outputs)?;
-    if let Some(report) = super::fast::try_run(checked, reg, inputs, outputs, &extents) {
+    // Index names are per-*occurrence* (a binder gets a fresh id, alpha-
+    // renaming and all), so "the axis named t" is every id with that name.
+    // Nothing marked stays allocation-free — that is what plain `run` does,
+    // and it should cost exactly what it did before this option existed.
+    let dynamic: Vec<bool> = if opts.dynamic.is_empty() {
+        Vec::new()
+    } else {
+        checked.index_names.iter().map(|n| opts.dynamic.contains(&n.as_str())).collect()
+    };
+    if let Some(report) = super::fast::try_run(checked, reg, inputs, outputs, &extents, &dynamic) {
         return Ok(report);
     }
     tree_walk(checked, reg, inputs, outputs, &extents);
-    Ok(RunReport { statements: checked.stmts.len(), ..RunReport::default() })
+    Ok(RunReport {
+        statements: checked.stmts.len(),
+        dynamic_axes: dynamic.iter().filter(|&&d| d).count(),
+        ..RunReport::default()
+    })
 }
 
 /// [`run`] on the tree-walking evaluator only — the semantics oracle.

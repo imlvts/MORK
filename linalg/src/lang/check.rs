@@ -60,6 +60,19 @@ pub struct Checked {
     pub(crate) index_names: Vec<String>,
 }
 
+impl Checked {
+    /// The source name of every index *occurrence* in the program, in id
+    /// order. Binders are alpha-renamed per occurrence, so a name may
+    /// appear several times — each entry is one axis of one loop nest.
+    ///
+    /// Useful for deciding what to pass to
+    /// [`RunOptions::dynamic`](super::RunOptions::dynamic): the names here
+    /// are exactly the ones that mark anything.
+    pub fn index_names(&self) -> &[String] {
+        &self.index_names
+    }
+}
+
 struct Ctx<'r, T> {
     reg: &'r Registry<T>,
     index_names: Vec<String>,

@@ -68,6 +68,18 @@
 //!    Every inline form is required to be bit-identical to the
 //!    [`super::FnDef::eval`] it replaces; a caller-registered function is
 //!    never inlined, because nothing here can know its bits.
+//! 5. **Dynamic axes** (RESUME.md step 6). By default every extent is a
+//!    constant in the generated code, so a compiled kernel is keyed by —
+//!    and only valid for — the exact shapes it saw. A caller whose shapes
+//!    move (a KV cache growing one position per token) then pays a fresh
+//!    Cranelift compile per shape. [`super::RunOptions::dynamic`] names
+//!    index axes whose extent should instead be passed to the kernel as a
+//!    **runtime argument**; those axes drop out of the cache key
+//!    ([`jit_route::Key`]), so one kernel serves every extent of them
+//!    while every other extent stays baked. Nothing about the plan, the
+//!    loop nest, the iteration order or the arithmetic changes — the
+//!    marking decides what is a constant and nothing else, which is why a
+//!    dynamic axis is bit-identical to the same axis static.
 
 use std::collections::HashMap;
 
@@ -793,6 +805,15 @@ pub struct RunReport {
     /// (a caller-registered function, always).
     pub inline_fn_ops: usize,
     pub indirect_fn_ops: usize,
+    /// Index axes actually marked **dynamic** for this run: the entries of
+    /// [`RunOptions::dynamic`](super::RunOptions::dynamic) that named an
+    /// index this program has. A name that matches nothing is ignored, so
+    /// comparing this against what you asked for is how to catch a typo.
+    pub dynamic_axes: usize,
+    /// Reductions lowered to the JIT with at least one axis compiled as a
+    /// runtime argument — i.e. reductions whose compiled kernel is shared
+    /// across every extent of that axis instead of one kernel per shape.
+    pub jit_dynamic_reductions: usize,
 }
 
 impl RunReport {
@@ -809,6 +830,12 @@ impl RunReport {
 struct Fast<'a, T: Elem> {
     reg: &'a Registry<T>,
     extents: &'a [usize],
+    /// Per index id: is this axis a runtime argument to generated code?
+    /// Affects *only* what the JIT bakes in and how kernels are keyed —
+    /// never an extent, an iteration order or an arithmetic operation.
+    /// **Empty means "none"**, so the default all-static path allocates
+    /// nothing; read it through [`Fast::is_dynamic`], never by index.
+    dynamic: &'a [bool],
     n_ids: usize,
     bufs: Vec<Buf<'a, T>>,
     shapes: Vec<Vec<usize>>,
@@ -817,6 +844,12 @@ struct Fast<'a, T: Elem> {
 }
 
 impl<'a, T: Elem> Fast<'a, T> {
+    /// Is index `id`'s extent a runtime argument? See [`Fast::dynamic`].
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    fn is_dynamic(&self, id: IndexId) -> bool {
+        self.dynamic.get(id as usize).copied().unwrap_or(false)
+    }
+
     fn slices(&self) -> Vec<&[T]> {
         self.bufs.iter().map(|b| b.as_slice()).collect()
     }
@@ -907,12 +940,13 @@ impl<'a, T: Elem> Fast<'a, T> {
         let shape: Vec<usize> = free.iter().map(|&i| self.extents[i as usize]).collect();
 
         #[cfg(feature = "jit")]
-        if let Some((data, n_load_maps, has_store_map)) =
+        if let Some((data, n_load_maps, any_dynamic, has_store_map)) =
             self.try_jit(op, bound, free, body, store_maps, &shape)
         {
             self.report.jit_reductions += 1;
             self.report.jit_load_maps += n_load_maps;
             self.report.jit_store_maps += usize::from(has_store_map);
+            self.report.jit_dynamic_reductions += usize::from(any_dynamic);
             return self.push(data, shape);
         }
 
@@ -990,7 +1024,7 @@ mod jit_route {
     use crate::einsum::{Combine, Reduce};
     use crate::jit::{EinsumF32Jit, JitInput, UnaryMap};
     use std::any::{Any, TypeId};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     /// The built-ins this backend can emit *exactly* — see
@@ -1024,41 +1058,83 @@ mod jit_route {
         *(Box::new(v) as Box<dyn Any>).downcast::<Vec<T>>().expect("checked: T is f32")
     }
 
-    /// Everything the generated code bakes in.
+    /// Everything the generated code bakes in — and *only* that.
+    ///
+    /// Two calls that agree on this key must be servable by the same
+    /// machine code, so every axis whose extent is a compile-time constant
+    /// has to appear here and every axis that is a runtime argument has to
+    /// *not*. Hence:
+    ///
+    /// - `spec` — the contraction's shape as a string, which fixes the loop
+    ///   nest, the per-input index patterns and the output pattern;
+    /// - `sparse_mask` — the per-input **layout** (bit `i` set = input `i`
+    ///   is sparse), because dense addressing and CSR row iteration are
+    ///   different code. `lang` never sets a bit (a non-contiguous input
+    ///   sends the whole run to the tree-walker), but the key states the
+    ///   dependency rather than relying on that;
+    /// - `in_dims` / `out_dims` — the **static** extents, per axis, with
+    ///   `None` at every axis compiled as a runtime argument. The `None`
+    ///   pattern is what makes two differently-marked calls distinct keys,
+    ///   so no separate "which axes are dynamic" field is needed;
+    /// - `reduce` / `combine` and the map chains — the arithmetic emitted
+    ///   inside the nest.
+    ///
+    /// A fully static call therefore keys exactly as it did before dynamic
+    /// axes existed (`in_dims` is all `Some`), and marking an axis dynamic
+    /// collapses every extent of it onto one entry.
     #[derive(PartialEq, Eq)]
     pub(super) struct Key {
         pub spec: String,
-        pub in_shapes: Vec<Vec<usize>>,
-        pub out_shape: Vec<usize>,
+        pub sparse_mask: u32,
+        pub in_dims: Vec<Vec<Option<usize>>>,
+        pub out_dims: Vec<Option<usize>>,
         pub reduce: Reduce,
         pub combine: Combine,
         pub load_maps: Vec<Vec<UnaryMap>>,
         pub store_map: Vec<UnaryMap>,
     }
 
+    /// One cache slot. `jit` is `None` for a pattern the backend refused,
+    /// so we never re-pay ~400 µs of Cranelift to be told "unsupported" a
+    /// second time. `used` is a logical clock stamp for eviction; it is a
+    /// [`Cell`] so a hit stays on the shared `borrow()` path.
+    pub(super) struct Slot {
+        key: Key,
+        jit: Option<Rc<EinsumF32Jit>>,
+        used: Cell<u64>,
+    }
+
     thread_local! {
-        /// Compiled kernels. A `None` payload records a pattern the
-        /// backend refused, so we never re-pay ~400 µs of Cranelift to be
-        /// told "unsupported" a second time.
-        static CACHE: RefCell<Vec<(Key, Option<Rc<EinsumF32Jit>>)>> =
-            const { RefCell::new(Vec::new()) };
+        static CACHE: RefCell<Vec<Slot>> = const { RefCell::new(Vec::new()) };
+        static CLOCK: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Bound on cached kernels: JIT pages stay mapped as long as they are
     /// held, and the language targets a handful of hot programs.
     const CACHE_CAP: usize = 256;
 
+    fn tick() -> u64 {
+        CLOCK.with(|c| {
+            let t = c.get() + 1;
+            c.set(t);
+            t
+        })
+    }
+
     pub(super) fn compiled(
         key: Key,
         inputs: &[JitInput],
         out_shape: &[usize],
+        dynamic: &[char],
     ) -> Option<Rc<EinsumF32Jit>> {
+        let now = tick();
         CACHE.with(|c| {
-            if let Some((_, hit)) = c.borrow().iter().find(|(k, _)| *k == key) {
-                return hit.clone();
+            if let Some(slot) = c.borrow().iter().find(|s| s.key == key) {
+                slot.used.set(now);
+                return slot.jit.clone();
             }
             let loads: Vec<&[UnaryMap]> = key.load_maps.iter().map(|m| m.as_slice()).collect();
-            let built = EinsumF32Jit::compile_reduce_mapped(
+            let built = EinsumF32Jit::compile_reduce_mapped_dyn(
                 &key.spec,
                 key.reduce,
                 key.combine,
@@ -1066,18 +1142,30 @@ mod jit_route {
                 &key.store_map,
                 inputs,
                 &[out_shape.to_vec()],
+                dynamic,
             )
             .ok()
             .map(Rc::new);
             drop(loads);
             let mut c = c.borrow_mut();
-            if c.len() >= CACHE_CAP {
-                let half = c.len() / 2;
-                c.drain(..half);
+            // Evict one entry — the least recently used — rather than half
+            // the cache. Dropping half means a program whose working set
+            // merely *touches* the cap re-compiles its own hot kernels
+            // mid-run; dropping the coldest single entry keeps the hot set
+            // resident as long as it fits. O(n) at n ≤ CACHE_CAP, and only
+            // on a miss, which already costs a Cranelift compile.
+            if c.len() >= CACHE_CAP
+                && let Some(victim) = (0..c.len()).min_by_key(|&i| c[i].used.get())
+            {
+                c.swap_remove(victim);
             }
-            c.push((key, built.clone()));
+            c.push(Slot { key, jit: built.clone(), used: Cell::new(now) });
             built
         })
+    }
+
+    pub(super) fn cache_len() -> usize {
+        CACHE.with(|c| c.borrow().len())
     }
 
     pub(super) fn run_into(
@@ -1205,7 +1293,7 @@ impl<T: Elem> Fast<'_, T> {
         body: &FExpr<T>,
         store_maps: &[usize],
         out_shape: &[usize],
-    ) -> Option<(Vec<T>, usize, bool)> {
+    ) -> Option<(Vec<T>, usize, bool, bool)> {
         use crate::einsum::Reduce;
         use crate::jit::{JitInput, UnaryMap};
 
@@ -1271,14 +1359,32 @@ impl<T: Elem> Fast<'_, T> {
             letters(free)
         );
 
+        // ── Dynamic axes: spec letters whose extent the generated code
+        // takes as an argument instead of baking. Marked per *index*, so a
+        // letter is dynamic exactly when the index it stands for is. The
+        // extents themselves are unchanged — this only decides what is a
+        // constant, and therefore what the cache key has to distinguish. ──
+        let dynamic: Vec<char> = appearance
+            .iter()
+            .filter(|&&id| self.is_dynamic(id))
+            .map(|id| (b'a' + slot_of[id]) as char)
+            .collect();
+        let is_dyn = |id: IndexId| self.is_dynamic(id);
+
         let bufs = self.slices();
         let mut inputs: Vec<JitInput> = Vec::with_capacity(leaves.len());
-        let mut in_shapes: Vec<Vec<usize>> = Vec::with_capacity(leaves.len());
+        let mut in_dims: Vec<Vec<Option<usize>>> = Vec::with_capacity(leaves.len());
         for leaf in &leaves {
             let data = jit_route::as_f32_slice(bufs[leaf.buf])?;
             let shape = self.shapes[leaf.buf].clone();
             debug_assert_eq!(shape.len(), leaf.indices.len());
-            in_shapes.push(shape.clone());
+            in_dims.push(
+                leaf.indices
+                    .iter()
+                    .zip(&shape)
+                    .map(|(&id, &d)| if is_dyn(id) { None } else { Some(d) })
+                    .collect(),
+            );
             inputs.push(JitInput::DenseSlice { data, shape });
         }
         // An empty `load_maps` *is* "no maps" for the backend, so an
@@ -1294,18 +1400,40 @@ impl<T: Elem> Fast<'_, T> {
 
         let key = jit_route::Key {
             spec,
-            in_shapes,
-            out_shape: out_shape.to_vec(),
+            // Every leaf is a `DenseSlice`: `try_run` bails out before this
+            // point if any input lacks a contiguous row-major image.
+            sparse_mask: 0,
+            in_dims,
+            out_dims: free
+                .iter()
+                .zip(out_shape)
+                .map(|(&id, &d)| if is_dyn(id) { None } else { Some(d) })
+                .collect(),
             reduce,
             combine,
             load_maps,
             store_map,
         };
-        let jit = jit_route::compiled(key, &inputs, out_shape)?;
+        let jit = jit_route::compiled(key, &inputs, out_shape, &dynamic)?;
         let identity = if reduce == Reduce::Sum { 0.0f32 } else { 1.0f32 };
         let out = jit_route::run_into(&jit, &inputs, out_shape, identity);
-        Some((jit_route::from_f32_vec(out), n_mapped, n_store > 0))
+        Some((jit_route::from_f32_vec(out), n_mapped, !dynamic.is_empty(), n_store > 0))
     }
+}
+
+/// Compiled-kernel cache entries held by this thread — i.e. how many
+/// distinct cache keys ([`jit_route::Key`]) have been seen, one Cranelift
+/// compile each.
+///
+/// Diagnostics only; it says nothing about results. It is the number
+/// [`RunOptions::dynamic`](super::RunOptions::dynamic) exists to shrink:
+/// a `t`-dependent contraction run at 32 different `t` is 32 entries with
+/// `t` static and 1 with `t` dynamic. The cache is per thread and bounded
+/// (least-recently-used eviction above 256 entries), so this saturates
+/// rather than growing without limit.
+#[cfg(feature = "jit")]
+pub fn jit_cache_len() -> usize {
+    jit_route::cache_len()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1328,6 +1456,7 @@ pub(super) fn try_run<T: Elem>(
     inputs: &[(&str, &dyn NDIndex<T>)],
     outputs: &mut [(&str, &mut dyn NDIndex<T>)],
     extents: &[usize],
+    dynamic: &[bool],
 ) -> Option<RunReport> {
     let mut bufs: Vec<Buf<T>> = Vec::with_capacity(inputs.len());
     let mut shapes: Vec<Vec<usize>> = Vec::with_capacity(inputs.len());
@@ -1342,6 +1471,7 @@ pub(super) fn try_run<T: Elem>(
     let mut f = Fast {
         reg,
         extents,
+        dynamic,
         n_ids,
         bufs,
         shapes,
@@ -1349,6 +1479,7 @@ pub(super) fn try_run<T: Elem>(
         report: RunReport {
             statements: checked.stmts.len(),
             kernel_statements: checked.stmts.len(),
+            dynamic_axes: dynamic.iter().filter(|&&d| d).count(),
             ..RunReport::default()
         },
     };
