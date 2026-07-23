@@ -1,15 +1,19 @@
-# GPT-2 on the `linalg` einsum VM
+# GPT-2 on `linalg`
 
-A small GPT-2-shaped decoder-only transformer whose every matmul / contraction
-runs through `linalg`'s einsum VM. It exists to show that the *linear algebra*
-of a full transformer forward pass — the QKV / attention / output / MLP / LM-head
-contractions — expresses as einsum, and to check the Rust implementation against
-a Python reference bit-for-bit (modulo float summation order).
+A small GPT-2-shaped decoder-only transformer, decoded one token at a time on
+`linalg`. It exists to show that a full transformer forward pass expresses in
+the crate's own vocabulary, and to check the Rust implementation against a
+Python reference bit-for-bit (modulo float summation order).
 
-The einsum VM handles only the contractions. The elementwise and reduction
-steps — RMSNorm, ReLU, softmax, residual adds, the `1/sqrt(head_dim)` scale —
-are *not* einsum; they're plain loops over the flat `Dense<f32>` storage (see
-[Architecture](#architecture) for which spec each contraction uses).
+The example implements the **same forward pass twice** and runs both:
+
+| backend | what it uses |
+|---|---|
+| `Backend::Einsum` | every contraction through the einsum VM (`einsum_homogenous`); RMSNorm, ReLU, softmax, residual adds and the `1/sqrt(head_dim)` scale as hand-rolled loops over the flat `Dense<f32>` storage |
+| `Backend::Lang`   | **all** of it — contractions *and* elementwise — as five [`linalg::lang`] programs, parsed and scope-checked once at load and `run` per decode step |
+
+The two are compared against each other (they agree bit for bit) and the
+language's logits are compared against the NumPy reference.
 
 The same architecture is written **three times against one set of einsum specs**:
 
@@ -17,7 +21,7 @@ The same architecture is written **three times against one set of einsum specs**
 |---|---|---|
 | `train.py` | PyTorch (`torch.einsum`) | trains the model, exports weights |
 | `gpt2_reference.py` | NumPy (`np.einsum`) | reference forward, dumps logits |
-| `main.rs` | `linalg` einsum VM | the example, compared against the reference |
+| `main.rs` | `linalg` einsum VM *and* `linalg::lang` | the example, compared against the reference |
 
 ## Architecture
 
@@ -45,9 +49,64 @@ The einsum specs, shared across all three implementations (batch/position axes
 | output projection | `ohj,hj->o` | `wo [o,h,j]` · heads `[h,j]` |
 | MLP / LM head | `od,d->o` | dense weight `[o,d]` · `[d]` |
 
-The elementwise pieces the einsum VM doesn't cover — RMSNorm, ReLU, softmax,
-residual adds, the `1/sqrt(head_dim)` scale — are plain loops over the flat
-`Dense<f32>` storage.
+## The forward pass as language programs
+
+`cargo run --release --example gpt2 -- programs` prints them. There are five,
+split only by where the KV cache has to be appended to and where a residual has
+to be captured — nothing about the math forced the split. The dimensions and
+`rms_eps` are baked in as literals from `config.txt`:
+
+```text
+── program embed ──
+j[d] = tok[d] + pos[d]
+x[d] = j[d] * (1.0 / sqrt(sum(e: j[e] * j[e]) / 64.0 + 1e-5))
+
+── program qkv ──
+nx[d] = x[d] * (1.0 / sqrt(sum(e: x[e] * x[e]) / 64.0 + 1e-5))
+q[h,j] = sum(d: wq[h,j,d] * nx[d])
+k[h,j] = sum(d: wk[h,j,d] * nx[d])
+v[h,j] = sum(d: wv[h,j,d] * nx[d])
+
+── program attn ──
+s[h,t]  = sum(j: q[h,j] * keys[t,h,j]) * 2.5e-1
+mx[h]   = max(t: s[h,t])
+ex[h,t] = exp(s[h,t] - mx[h])
+zs[h]   = sum(t: ex[h,t])
+w[h,t]  = ex[h,t] * (1.0 / zs[h])
+hd[h,j] = sum(t: w[h,t] * vals[t,h,j])
+pr[o]   = sum(h, j: wo[o,h,j] * hd[h,j])
+y[o]    = pr[o] + x[o]
+
+── program mlp ──
+nx[d] = x[d] * (1.0 / sqrt(sum(e: x[e] * x[e]) / 64.0 + 1e-5))
+h1[o] = relu(sum(d: fc1[o,d] * nx[d]))
+y[e]  = sum(m: fc2[e,m] * h1[m]) + x[e]
+
+── program head ──
+logits[v] = sum(d: lm[v,d] * x[d])
+```
+
+Notes on the two idioms that look roundabout:
+
+- RMSNorm and softmax multiply by a **hoisted reciprocal** (`… * (1.0 / z)`)
+  rather than dividing per element. The kernel path hoists any subexpression
+  that does not depend on the innermost loop index, so this is one reciprocal
+  per row — and it is the operation sequence the hand-rolled loops perform, so
+  the two backends stay bit-identical.
+- Softmax is written in its stable form (subtract the row max), matching the
+  reference.
+
+Four things the surrounding Rust still does, because the language does not
+express them:
+
+| step | why |
+|---|---|
+| `wte[token] / wpe[pos]` row slice | an embedding **gather**: indexing by a runtime value, not by a loop index |
+| appending `k`/`v` to the KV cache | a **scatter/append** into a growing buffer |
+| `argmax(logits)` | reductions yield **values, not positions** |
+| allocating each output | plumbing, not arithmetic |
+
+Every floating-point operation applied to a model value is in the language.
 
 ## Running
 
@@ -59,10 +118,15 @@ uv run examples/gpt2/train.py
 # 2. NumPy reference forward: greedy-decode and write weights/ref_logits.bin.
 uv run examples/gpt2/gpt2_reference.py
 
-# 3. The Rust example: load the same weights, decode through the linalg einsum
-#    VM, and compare its logits against the reference.
+# 3. The Rust example: load the same weights, decode on both backends, and
+#    compare against each other and against the reference.
 cargo run --release --example gpt2
+cargo run --release --example gpt2 -- programs   # print the programs
+cargo run --release --example gpt2 -- bench      # time both backends
 ```
+
+Add `--features jit` to compile the language's eligible contractions with
+Cranelift instead of running them on the blocked tape kernel.
 
 `uv` is used per the repo convention — no manual venv needed; dependencies are
 declared inline (PEP 723) at the top of each script.
@@ -74,6 +138,16 @@ prompt: "the spar"
 output: "the sparse tensor hums a quiet t"
 tokens: [21, 10, 7, 0, 20, 17, 3, 19, ...]
 
+── language execution ──
+runs               : 352 (1536 statements), 1536 on the kernel fast path
+reductions         : 1120 JIT / 96 tape (96 with a fused store map)
+scalar fn calls    : 96 inline / 0 indirect
+
+── language vs einsum VM ──
+token streams      : identical
+max abs logit diff : 0.000e0
+bit-identical      : 648/648 logits
+
 ── comparison vs NumPy reference ──
 steps compared     : 24
 max abs logit diff : 1.717e-5
@@ -81,14 +155,25 @@ argmax agreement   : 24/24
 RESULT: MATCH ✓
 ```
 
-The `~1e-5` residual is float32 summation-order difference between the linalg
-VM, NumPy, and PyTorch; the greedy token streams are identical.
+The `~1e-5` residual is float32 summation-order difference between `linalg`,
+NumPy, and PyTorch; the greedy token streams are identical. The 96 tape
+reductions are the softmax row maxima — `max`/`min` folds are deliberately kept
+off the JIT because Cranelift's `fmax`/`fmin` disagree with the language's
+comparison fold on `±0.0` and NaN.
+
+### Benchmark
+
+`-- bench` decodes the whole context from a cold KV cache on both backends and
+reports per-token latency, plus what the *growing* KV cache costs the language:
+one compiled kernel per (contraction site, context length) pair, since the
+compiled-kernel cache is keyed by shape.
 
 ### Running without the trained weights
 
 `cargo run --release --example gpt2` works with no `weights/` directory: it
 falls back to deterministic random weights (a self-contained smoke test that
-just exercises the einsum forward pass) and skips the comparison.
+exercises both backends and checks them against each other) and skips the
+reference comparison.
 
 ## Retraining / reconfiguring
 
@@ -96,8 +181,9 @@ Model size, corpus, and training length live at the top of `train.py`
 (`N_EMBD`, `N_HEAD`, `N_LAYER`, `MLP_HIDDEN`, `BLOCK_SIZE`, `STEPS`, `CORPUS`,
 `N_GENERATE`). The exported `config.txt` carries the dims, so after retraining
 the NumPy reference and the Rust example pick up the new shape automatically —
-no code changes needed. Re-run steps 2 and 3 after any retrain so
-`ref_logits.bin` matches the new weights.
+no code changes needed (the language programs are formatted from `config.txt`
+at startup). Re-run steps 2 and 3 after any retrain so `ref_logits.bin` matches
+the new weights.
 
 The checked-in `weights/` is the model produced by the committed `train.py`, so
 steps 2–3 run out of the box without retraining.
