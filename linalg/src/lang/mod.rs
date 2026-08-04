@@ -14,7 +14,9 @@
 //! validation, alpha-renaming) → [`run`] (bind names/extents against an
 //! environment, then execute). Element type is monomorphic per program;
 //! scalar functions and reduction operators live in a [`Registry`]
-//! extended statically in code.
+//! extended statically in code. [`Checked::explain`] prints what a checked
+//! program means as explicit nested loops and assignments — the fastest
+//! way to see where a reduction materializes and in what order.
 //!
 //! Execution is v1-simple by design: every reduction node materializes a
 //! temporary computed once at its own index arity — which is what makes
@@ -50,6 +52,7 @@ use crate::tensor::Scalar;
 pub mod ast;
 mod check;
 mod eval;
+mod explain;
 mod fast;
 mod parse;
 mod sexpr;

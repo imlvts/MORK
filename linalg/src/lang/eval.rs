@@ -434,7 +434,7 @@ pub fn run_reference<T: Elem>(
 /// Phase 1, shared by both execution paths: validate the name sets and
 /// infer every index's extent. The error surface lives entirely here, so
 /// which path runs afterwards can never change what a program rejects.
-fn bind<T: Elem>(
+pub(super) fn bind<T: Elem>(
     checked: &Checked,
     inputs: &[(&str, &dyn NDIndex<T>)],
     outputs: &mut [(&str, &mut dyn NDIndex<T>)],

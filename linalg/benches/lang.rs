@@ -41,10 +41,13 @@
 //!   4c. single-kernel breakdown — where 4a/4b's leftover actually is
 //!   5. multi-statement stable softmax — statement/temp overhead
 //!   6. dynamic axes (RESUME step 6)
+//!   7. every benchmarked program as nested loops (`Checked::explain`)
 //!   1b. the fixed cost re-measured after the suite (cache-growth check)
 //!
 //! Run with `cargo bench --bench lang` (add `--features jit` for the JIT
-//! arm of section 2). `LANG_BENCH_SECTIONS=0,4` runs a subset.
+//! arm of section 2). `LANG_BENCH_SECTIONS=0,4` runs a subset;
+//! `LANG_BENCH_SECTIONS=7` prints the program listing and measures
+//! nothing.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -376,6 +379,57 @@ fn softmax_stable_unfused_langbuf(x: &[f32], out: &mut [f32]) {
     out.copy_from_slice(&scaled);
 }
 
+// ─── the program sources, in one place ──────────────────────────────────
+
+/// Every program this file benchmarks. Each compile site below draws its
+/// source from here, and section 7 prints the loop-nest lowering of
+/// [`SOURCES`] — so "which programs does this bench run?" has exactly one
+/// answer, and adding an arm means adding an entry.
+mod src {
+    pub const TRIVIAL: &str = "y[i] = x[i]";
+    pub const MATMUL: &str = "c[i,k] = sum(j: a[i,j] * b[j,k])";
+    pub const RMS_DIV: &str = "y[i] = x[i] / sqrt(sum(j: x[j]*x[j]) / n + eps)";
+    pub const RMS_MUL: &str = "y[i] = x[i] * (1.0 / sqrt(sum(j: x[j]*x[j]) / n + eps))";
+    pub const SM_2N: &str = "soft[i] = exp(v[i]) / sum(j: exp(v[j]))";
+    pub const SM_N_DIV: &str = "e[i] = exp(v[i])\nsoft[i] = e[i] / sum(j: e[j])";
+    pub const SM_N_MUL: &str = "e[i] = exp(v[i])\nsoft[i] = e[i] * (1.0 / sum(j: e[j]))";
+    pub const SM_STABLE: &str = "m       = max(j: v[j])\n\
+                                 e[i]    = exp(v[i] - m)\n\
+                                 soft[i] = e[i] * (1.0 / sum(j: e[j]))";
+    pub const RED_SUMSQ: &str = "s = sum(j: x[j]*x[j])";
+    pub const MAP_SCALE: &str = "y[i] = x[i] * c";
+    pub const MAP_EXP: &str = "y[i] = exp(x[i])";
+    pub const MIXED: &str = "y[j,k] = q[k] * min(l: x[l]) * sqrt(sum(l: M[l,j]))";
+    /// Section 5's stable softmax written as two statements — the same
+    /// math as [`SM_STABLE`], one statement fewer and dividing rather
+    /// than multiplying by the reciprocal.
+    pub const SM_STABLE_2: &str = "m       = max(j: v[j])\n\
+                                   soft[i] = exp(v[i] - m) / sum(j: exp(v[j] - m))";
+    /// The same inlined into one statement, which recomputes the maximum
+    /// twice — there is no CSE, and section 7's print shows the two
+    /// separate temporaries that result.
+    pub const SM_STABLE_1: &str =
+        "soft[i] = exp(v[i] - max(j: v[j])) / sum(j: exp(v[j] - max(k: v[k])))";
+
+    /// Every source above, labelled — the section 7 listing.
+    pub const SOURCES: &[(&str, &str)] = &[
+        ("trivial (map)", TRIVIAL),
+        ("matmul", MATMUL),
+        ("rmsnorm, divide", RMS_DIV),
+        ("rmsnorm, hoisted reciprocal", RMS_MUL),
+        ("softmax, 2n exp, divide", SM_2N),
+        ("softmax, n exp, divide (2 stmts)", SM_N_DIV),
+        ("softmax, n exp, reciprocal (2 stmts)", SM_N_MUL),
+        ("softmax, stable, matched (3 stmts)", SM_STABLE),
+        ("softmax, stable (2 stmts)", SM_STABLE_2),
+        ("softmax, stable, inlined (1 stmt)", SM_STABLE_1),
+        ("reduction only, sum of squares", RED_SUMSQ),
+        ("map only, scale", MAP_SCALE),
+        ("map only, exp", MAP_EXP),
+        ("mixed reduction", MIXED),
+    ];
+}
+
 // ─── lang driver helpers ────────────────────────────────────────────────
 
 fn compile(src: &str, reg: &Registry<f32>) -> Checked {
@@ -624,22 +678,17 @@ struct Programs {
 impl Programs {
     fn new(reg: &Registry<f32>) -> Self {
         Programs {
-            trivial: compile("y[i] = x[i]", reg),
-            matmul: compile("c[i,k] = sum(j: a[i,j] * b[j,k])", reg),
-            rms_div: compile("y[i] = x[i] / sqrt(sum(j: x[j]*x[j]) / n + eps)", reg),
-            rms_mul: compile("y[i] = x[i] * (1.0 / sqrt(sum(j: x[j]*x[j]) / n + eps))", reg),
-            sm_2n: compile("soft[i] = exp(v[i]) / sum(j: exp(v[j]))", reg),
-            sm_n_div: compile("e[i] = exp(v[i])\nsoft[i] = e[i] / sum(j: e[j])", reg),
-            sm_n_mul: compile("e[i] = exp(v[i])\nsoft[i] = e[i] * (1.0 / sum(j: e[j]))", reg),
-            sm_stable: compile(
-                "m       = max(j: v[j])\n\
-                 e[i]    = exp(v[i] - m)\n\
-                 soft[i] = e[i] * (1.0 / sum(j: e[j]))",
-                reg,
-            ),
-            red_sumsq: compile("s = sum(j: x[j]*x[j])", reg),
-            map_scale: compile("y[i] = x[i] * c", reg),
-            map_exp: compile("y[i] = exp(x[i])", reg),
+            trivial: compile(src::TRIVIAL, reg),
+            matmul: compile(src::MATMUL, reg),
+            rms_div: compile(src::RMS_DIV, reg),
+            rms_mul: compile(src::RMS_MUL, reg),
+            sm_2n: compile(src::SM_2N, reg),
+            sm_n_div: compile(src::SM_N_DIV, reg),
+            sm_n_mul: compile(src::SM_N_MUL, reg),
+            sm_stable: compile(src::SM_STABLE, reg),
+            red_sumsq: compile(src::RED_SUMSQ, reg),
+            map_scale: compile(src::MAP_SCALE, reg),
+            map_exp: compile(src::MAP_EXP, reg),
         }
     }
 }
@@ -742,7 +791,7 @@ fn section_mixed(ck: &mut Checks, reg: &Registry<f32>) {
          \n--- nj={NJ} nk={NK} nl={NL} ---"
     );
 
-    let prog = compile("y[j,k] = q[k] * min(l: x[l]) * sqrt(sum(l: M[l,j]))", reg);
+    let prog = compile(src::MIXED, reg);
 
     let q = filled(vec![NK], 1);
     let x = filled(vec![NL], 2);
@@ -1261,16 +1310,9 @@ fn section_multi_statement(ck: &mut Checks, reg: &Registry<f32>) {
     println!("  stable-2stmt: m = max(j: v[j]) ; soft[i] = exp(v[i]-m) / sum(j: exp(v[j]-m))");
     println!("  stable-1stmt: same, inlined (recomputes max(j: v[j]) twice — no CSE yet)");
 
-    let naive = compile("soft[i] = exp(v[i]) / sum(j: exp(v[j]))", reg);
-    let stable2 = compile(
-        "m       = max(j: v[j])\n\
-         soft[i] = exp(v[i] - m) / sum(j: exp(v[j] - m))",
-        reg,
-    );
-    let stable1 = compile(
-        "soft[i] = exp(v[i] - max(j: v[j])) / sum(j: exp(v[j] - max(k: v[k])))",
-        reg,
-    );
+    let naive = compile(src::SM_2N, reg);
+    let stable2 = compile(src::SM_STABLE_2, reg);
+    let stable1 = compile(src::SM_STABLE_1, reg);
 
     for &n in &[64usize, 1024, 65536] {
         println!("\n--- n = {n} ---");
@@ -1512,6 +1554,42 @@ fn summarize(rms: &[RmsRow], sm: &[SmRow], fixed: &Fixed) {
     }
 }
 
+// ─── 7. the programs, as nested loops ───────────────────────────────────
+
+/// Print every benchmarked program's loop-nest lowering.
+///
+/// This is what the tables below are timings *of*: `Checked::explain`
+/// renders the materializing lowering the language is defined by — where
+/// each reduction's temporary is allocated, which loops it sits inside,
+/// and in what order the folds run. Reading an arm's cost against its
+/// nest answers most "why is this one slower?" questions before any
+/// profiling: `2n` vs `n` `exp` calls, a hoisted reciprocal, a maximum
+/// recomputed into two separate temporaries.
+///
+/// Extents stay symbolic (`0..|j|`) — every program here runs at several
+/// sizes, and the nest is the same shape at all of them.
+fn section_programs(reg: &Registry<f32>) {
+    println!("\n=== 7. programs, as nested loops ===");
+    println!("  `Checked::explain`: the lowering each timing below is of. `%k` is a");
+    println!("  materialized reduction temporary, `acck` its accumulator.");
+    for (label, source) in src::SOURCES {
+        println!("\n--- {label} ---");
+        for line in source.lines() {
+            println!("  {}", line.trim_end());
+        }
+        println!();
+        for line in compile(source, reg).explain(reg).lines() {
+            // Indent the nest under the section, without leaving trailing
+            // whitespace on its blank separator lines.
+            if line.is_empty() {
+                println!();
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+}
+
 // ─── main ───────────────────────────────────────────────────────────────
 
 fn wanted(section: usize) -> bool {
@@ -1530,6 +1608,17 @@ fn main() {
     println!("(jit feature: OFF — section 2's JIT arm skipped)");
 
     let reg = Registry::<f32>::builtins();
+
+    if wanted(7) {
+        section_programs(&reg);
+    }
+    // The listing is documentation, not a measurement — asking for it
+    // alone should not cost the fixed-cost section's several seconds.
+    if ![0, 2, 3, 4, 5, 6].iter().any(|&s| wanted(s)) {
+        println!("\n=== done (listing only) ===");
+        return;
+    }
+
     let programs = Programs::new(&reg);
     let mut ck = Checks::default();
 
