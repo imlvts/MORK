@@ -568,6 +568,51 @@ impl Expr {
         }
     }
     
+    /// `substitute_one_de_bruijn` for a substitution that is a *subexpression* of some
+    /// larger expression rather than a standalone one, and whose var-refs are therefore
+    /// numbered in that larger expression's namespace.
+    ///
+    /// `base` is the number of variables introduced ahead of the substitution there, so
+    /// its own introductions start at `base`. Refs at or above `base` point at those and
+    /// get rebased onto wherever the substitution lands; refs below `base` point at
+    /// binders of the expression being substituted into and keep their index.
+    ///
+    /// Passing `base == 0` is exactly `substitute_one_de_bruijn`.
+    pub fn substitute_one_de_bruijn_at(self, idx: u8, base: u8, substitution: Expr, oz: &mut ExprZipper) -> *const [u8] {
+        let mut var: u8 = item_byte(Tag::NewVar);
+        let nvs = self.newvars();
+        let mut vars = vec![Expr{ ptr: &mut var }; nvs];
+        vars[idx as usize] = substitution;
+        self.substitute_de_bruijn_at(base, &vars[..], oz)
+    }
+
+    /// `substitute_de_bruijn` where every substitution is numbered against an enclosing
+    /// namespace; see [`Expr::substitute_one_de_bruijn_at`]. `base == 0` reproduces
+    /// `substitute_de_bruijn` byte for byte.
+    pub fn substitute_de_bruijn_at(self, base: u8, substitutions: &[Expr], oz: &mut ExprZipper) -> *const [u8] {
+        let mut ez = ExprZipper::new(self);
+        let mut additions = vec![0u8; substitutions.len()];
+        let mut var_count = 0;
+        loop {
+            match ez.tag() {
+                Tag::NewVar => {
+                    let nvars = substitutions[var_count].shift_from(base, additions[var_count], oz);
+                    var_count += 1;
+                    for j in var_count..additions.len() { additions[j] += nvars; }
+                }
+                Tag::VarRef(r) => {
+                    substitutions[r as usize].bind_from(base, additions[r as usize], oz);
+                }
+                Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
+                Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
+            }
+
+            if !ez.next() {
+                return ez.finish_span()
+            }
+        }
+    }
+
     pub fn substitute_de_bruijn(self, substitutions: &[Expr], oz: &mut ExprZipper) -> *const [u8] {
         let mut ez = ExprZipper::new(self);
         let mut additions = vec![0u8; substitutions.len()];
@@ -613,6 +658,48 @@ impl Expr {
 
             if !ez.next() {
                 return ez.finish_span()
+            }
+        }
+    }
+
+    /// `bind` for a substitution numbered against an enclosing namespace; see
+    /// [`Expr::substitute_one_de_bruijn_at`]. `base == 0` reproduces `bind`.
+    fn bind_from(self, base: u8, n: u8, oz: &mut ExprZipper) -> *const [u8] {
+        let mut ez = ExprZipper::new(self);
+        let mut var_count = 0;
+        loop {
+            match ez.tag() {
+                Tag::NewVar => {
+                    oz.write_var_ref(n + var_count); oz.loc += 1; var_count += 1;
+                }
+                Tag::VarRef(i) => {
+                    oz.write_var_ref(if i >= base { n + (i - base) } else { i }); oz.loc += 1;
+                }
+                Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
+                Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
+            }
+
+            if !ez.next() {
+                return ez.finish_span()
+            }
+        }
+    }
+
+    /// `shift` for a substitution numbered against an enclosing namespace; see
+    /// [`Expr::substitute_one_de_bruijn_at`]. `base == 0` reproduces `shift`.
+    pub fn shift_from(self, base: u8, n: u8, oz: &mut ExprZipper) -> u8 {
+        let mut ez = ExprZipper::new(self);
+        let mut new_var = 0u8;
+        loop {
+            match ez.tag() {
+                Tag::NewVar => { oz.write_new_var(); oz.loc += 1; new_var += 1; }
+                Tag::VarRef(i) => { oz.write_var_ref(if i >= base { i - base + n } else { i }); oz.loc += 1; }
+                Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
+                Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
+            }
+
+            if !ez.next() {
+                return new_var;
             }
         }
     }

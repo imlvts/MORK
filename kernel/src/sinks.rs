@@ -1168,7 +1168,13 @@ impl Sink for PureSink {
                         };
                         trace!(target: "sink", "pattern guard result {:?}", serialize(&res[..]));
 
-                        let mut pairs = vec![(pat_env, ExprEnv::new(1, Expr { ptr: res.as_mut_ptr() }))];
+                        // The result is a subexpression of the stored triple's namespace, not a
+                        // standalone one: eval preserves the numbering it was handed, so a
+                        // variable introduced inside the call carries its global index. Giving
+                        // the result `call_env.v` as its de Bruijn base is what makes that index
+                        // resolve to the introduction it came from; a fresh namespace leaves the
+                        // ref dangling and it prints as a second, unrelated variable (#135).
+                        let mut pairs = vec![(pat_env, ExprEnv { n: 0, v: call_env.v, offset: 0, base: Expr { ptr: res.as_mut_ptr() } })];
                         match unify(&mut pairs) {
                             Ok(bindings) => {
                                 pbuffer.clear();
@@ -1226,7 +1232,11 @@ impl Sink for PureSink {
                         let ie = Expr { ptr: (&varref[0] as *const u8).cast_mut() };
                         let mut oz = ExprZipper::new(Expr{ ptr: buffer.as_mut_ptr() });
                         trace!(target: "sink", "ref guard '{}' var {:?} with '{}'", serialize(varref), k, serialize(&res[..]));
-                        let os = ie.substitute_one_de_bruijn(k, Expr{ ptr: res.as_mut_ptr() }, &mut oz);
+                        // Same namespace question as the pattern arm above (#135). Here the
+                        // pattern is a bare var-ref and introduces nothing, so the variables
+                        // ahead of the call are exactly the template's own introductions.
+                        let base = ie.newvars() as u8;
+                        let os = ie.substitute_one_de_bruijn_at(k, base, Expr{ ptr: res.as_mut_ptr() }, &mut oz);
                         unsafe { buffer.set_len(oz.loc) }
                         trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
