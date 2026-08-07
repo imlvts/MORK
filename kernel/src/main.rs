@@ -1225,6 +1225,57 @@ fn sink_pure_symbol_guard() {
     assert_eq!(res, "(ok 123)\n");
 }
 
+fn sink_pure_constant_template_guard() {
+    let mut s = Space::new();
+
+    // A guard whose template holds no variable must still emit. reverse_symbol(123) is
+    // 321, so the accepting guards are execs 0, 1 and 3, and the rejecting ones are
+    // execs 2 and 5. Templates: 0 and 1 are constant (a bare symbol and a compound),
+    // 3 and 5 carry a variable, and 4 reaches a constant template through the NewVar
+    // arm rather than the pattern arm.
+    //
+    // The controls are what make a missing `yes` diagnostic rather than ambiguous.
+    // exec 3 emitting proves the guard accepts, so `yes` and `(ok const)` are not
+    // being rejected. exec 4 emitting proves a constant template is representable at
+    // all, so they are not being dropped for want of somewhere to live. exec 5 staying
+    // absent pins rejection independently of the constant-template question, which
+    // exec 2 alone cannot do since it is both rejecting and constant.
+    //
+    // exec 6 covers a second, older defect in the same addressing. The NewVar arm moved
+    // to the absolute template path without cutting it down to the write root, so it
+    // emitted root ++ template. That was only visible when the root was shorter than the
+    // template, i.e. when the template held a variable: `(tag $q)` came out as
+    // `(tag (tag $a))`. With a constant template the surplus bytes trailed a complete
+    // expression and the dump read the leading part, so exec 4 alone cannot catch it.
+    const SPACE_EXPRS: &str = r#"
+(exec 0 (,) (O (pure yes 321 (reverse_symbol 123))))
+(exec 1 (,) (O (pure (ok const) 321 (reverse_symbol 123))))
+(exec 2 (,) (O (pure (no const) 999 (reverse_symbol 123))))
+(exec 3 (,) (O (pure (ctl $z) 321 (reverse_symbol 123))))
+(exec 4 (,) (O (pure ignored $ (reverse_symbol 123))))
+(exec 5 (,) (O (pure (rej $z) 999 (reverse_symbol 123))))
+(exec 6 (,) (O (pure (tag $q) $ (reverse_symbol 123))))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    // The execs are consumed, so the whole space is the emitted set. Sorted, because
+    // the space is a set and dump order is not what this test pins down.
+    let mut v = vec![];
+    s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v);
+    let dumped = String::from_utf8_lossy_owned(v);
+    let mut lines: Vec<&str> = dumped.lines().filter(|l| !l.is_empty()).collect();
+    lines.sort();
+    let res = lines.join("\n");
+
+    println!("result: {res}");
+    assert_eq!(res, "(ctl $a)\n(ok const)\n(tag $a)\nignored\nyes");
+}
+
 fn sink_pure_compound_multiplicity() {
     let mut s = Space::new();
 
@@ -6335,6 +6386,7 @@ fn main() {
             sink_pure_compound_capture();
             sink_pure_pattern_rejection();
             sink_pure_symbol_guard();
+            sink_pure_constant_template_guard();
             sink_pure_compound_multiplicity();
             sink_bass64url_ident();
             sink_hex_ident();
